@@ -123,7 +123,7 @@ Run `just` to see all tasks.
 
 Releases are automatic. You do not run anything.
 
-1. Open a pull request. CI runs `cargo fmt`, `cargo clippy` and `cargo test`.
+1. Open a pull request. CI runs `cargo fmt`, `cargo clippy` and `cargo test`. [CodeRabbit](https://coderabbit.ai) reviews the code. Its settings are in `.coderabbit.yaml`.
 2. Merge it to `main`. You cannot push to `main` directly.
 3. [semantic-release](https://semantic-release.gitbook.io) reads the commit messages since the last tag:
    - `fix:` makes a patch release (0.2.0 → 0.2.1).

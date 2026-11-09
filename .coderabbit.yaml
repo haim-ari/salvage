@@ -1,0 +1,36 @@
+# CodeRabbit AI review on every pull request. Free for public repos.
+# Docs: https://docs.coderabbit.ai/reference/configuration
+# yaml-language-server: $schema=https://coderabbit.ai/integrations/schema.v2.json
+language: en-US
+reviews:
+  profile: chill
+  request_changes_workflow: false
+  high_level_summary: true
+  poem: false
+  review_status: true
+  collapse_walkthrough: true
+  auto_review:
+    enabled: true
+    drafts: false
+  path_filters:
+    - "!bun.lock"
+    - "!src-tauri/Cargo.lock"
+    - "!src-tauri/gen/**"
+    - "!src-tauri/icons/**"
+  path_instructions:
+    - path: "src-tauri/src/**/*.rs"
+      instructions: >-
+        Tauri 2 backend for a macOS app that restores deleted iCloud Drive files.
+        Look for bugs, data loss, panics, races and security problems
+        (commands exposed to the web view, file paths, network calls).
+    - path: "ui/**/*.js"
+      instructions: >-
+        Vanilla JS UI with no build step. It talks to Rust through window.__TAURI__.
+        Look for XSS (every value put into innerHTML must be escaped) and slow code
+        on large lists (60k+ items).
+    - path: ".github/**"
+      instructions: >-
+        Actions must be pinned by SHA. Token permissions must be minimal.
+        Use bun or bunx only, never npm, npx, yarn or pnpm.
+chat:
+  auto_reply: true
