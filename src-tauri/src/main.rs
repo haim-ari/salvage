@@ -33,6 +33,7 @@ pub struct AppState {
 }
 
 type CmdResult<T> = Result<T, ApiError>;
+type Page = Result<(Vec<Value>, Option<String>), ApiError>;
 
 fn now_ms() -> i64 {
     SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_millis() as i64).unwrap_or(0)
@@ -298,7 +299,7 @@ async fn scan(app: AppHandle, fresh: Option<bool>) -> CmdResult<Response> {
     let mut unverified = st.pages > 0;
 
     // The next page is asked for while the folders of this page are looked up.
-    let mut fetched: Option<Result<(Vec<Value>, Option<String>), ApiError>> = None;
+    let mut fetched: Option<Page> = None;
     while !st.complete {
         let page = match fetched.take() {
             Some(p) => p,

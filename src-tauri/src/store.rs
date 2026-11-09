@@ -10,6 +10,9 @@ use std::{
 
 use crate::model::Snapshot;
 
+/// Live folder id -> path, and every id Apple already answered.
+pub type Paths = (HashMap<String, Vec<String>>, HashSet<String>);
+
 /// Where a scan of Apple's list stopped. Pages already read are in `tombstones.jsonl`.
 #[derive(Serialize, Deserialize, Clone, Debug, Default)]
 pub struct ScanState {
@@ -115,7 +118,7 @@ impl Store {
     }
 
     /// Folder lookups already done: live id -> path, and every id Apple already answered.
-    pub fn paths(&self, dsid: &str) -> Option<(HashMap<String, Vec<String>>, HashSet<String>)> {
+    pub fn paths(&self, dsid: &str) -> Option<Paths> {
         let c: PathCache = self.read("paths-cache.json")?;
         (c.dsid == dsid).then_some((c.resolved, c.tried))
     }
