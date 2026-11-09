@@ -38,7 +38,8 @@ fn is_transient(msg: &str) -> bool {
         .any(|k| m.contains(k))
 }
 const MOVE_BATCH: usize = 200;
-const DOWNLOAD_PAR: usize = 8;
+const DOWNLOAD_PAR: usize = 12;
+const MOVE_PAR: usize = 4;
 
 #[derive(Deserialize, Clone, Debug)]
 #[serde(tag = "kind", rename_all = "camelCase", rename_all_fields = "camelCase")]
@@ -83,6 +84,8 @@ struct Reporter {
     p: Mutex<Progress>,
     last: Mutex<Instant>,
     bytes: AtomicU64,
+    /// failures already sent to the window; the list is sent again only when it grows
+    sent_failures: AtomicU64,
 }
 
 impl Reporter {
@@ -106,8 +109,18 @@ impl Reporter {
             return;
         }
         *last = Instant::now();
-        let mut snap = self.p.lock().clone();
-        snap.bytes = self.bytes.load(Ordering::Relaxed);
+        let snap = {
+            let mut p = self.p.lock();
+            let failures = std::mem::take(&mut p.failures);
+            let mut snap = p.clone();
+            let n = failures.len() as u64;
+            if self.sent_failures.swap(n, Ordering::Relaxed) != n || p.done {
+                snap.failures = failures.clone();
+            }
+            p.failures = failures;
+            snap
+        };
+        let snap = Progress { bytes: self.bytes.load(Ordering::Relaxed), ..snap };
         let _ = self.app.emit("restore://progress", snap);
     }
 }
@@ -126,11 +139,13 @@ fn components(path: &str) -> Vec<String> {
 
 /// Relative folder (as components) for each item under the destination.
 /// All in one folder: flat. Otherwise keep the deepest common folder's name and below.
+#[cfg(test)]
 pub fn relative_dirs(items: &[Item], folders: &[Folder]) -> Vec<Vec<String>> {
-    let paths: Vec<Vec<String>> = items
-        .iter()
-        .map(|it| folders.get(it.f as usize).map(|f| components(&f.path)).unwrap_or_default())
-        .collect();
+    dirs_of(items.iter().map(|it| it.f), folders)
+}
+
+fn dirs_of(fs: impl Iterator<Item = u32>, folders: &[Folder]) -> Vec<Vec<String>> {
+    let paths: Vec<Vec<String>> = fs.map(|f| folders.get(f as usize).map(|f| components(&f.path)).unwrap_or_default()).collect();
     let Some(first) = paths.first() else { return Vec::new() };
     if paths.iter().all(|p| p == first) {
         return vec![Vec::new(); paths.len()];
@@ -147,12 +162,8 @@ pub fn relative_dirs(items: &[Item], folders: &[Folder]) -> Vec<Vec<String>> {
 /// it, so copies never change the folder layout of what the person picked.
 fn rel_with_copies(items: &[Item], folders: &[Folder]) -> Vec<Vec<String>> {
     let shown: Vec<usize> = (0..items.len()).filter(|&i| items[i].o.is_empty()).collect();
-    let shown_items: Vec<Item> = shown.iter().map(|&i| items[i].clone()).collect();
-    let rel_shown = relative_dirs(&shown_items, folders);
-    let mut by_id: HashMap<&str, Vec<String>> = HashMap::new();
-    for (k, &i) in shown.iter().enumerate() {
-        by_id.insert(items[i].i.as_str(), rel_shown[k].clone());
-    }
+    let rel_shown = dirs_of(shown.iter().map(|&i| items[i].f), folders);
+    let by_id: HashMap<&str, Vec<String>> = shown.iter().map(|&i| items[i].i.as_str()).zip(rel_shown).collect();
     items
         .iter()
         .map(|it| {
@@ -179,6 +190,7 @@ pub async fn run(app: AppHandle, job: Job) {
         }),
         last: Mutex::new(Instant::now() - Duration::from_secs(1)),
         bytes: AtomicU64::new(0),
+        sent_failures: AtomicU64::new(0),
     });
     rep.emit(true);
     let started = Instant::now();
@@ -198,10 +210,12 @@ pub async fn run(app: AppHandle, job: Job) {
 
 async fn execute(app: &AppHandle, job: &Job, rep: &Arc<Reporter>) -> Result<(), ApiError> {
     let state = app.state::<AppState>();
-    let already: HashSet<String> = state.restored.lock().clone();
 
     // ---- Phase 1: recover ----
-    let (done_before, todo): (Vec<&Item>, Vec<&Item>) = job.items.iter().partition(|i| already.contains(&i.i));
+    let (done_before, todo): (Vec<&Item>, Vec<&Item>) = {
+        let already = state.restored.lock();
+        job.items.iter().partition(|i| already.contains(&i.i))
+    };
     rep.update(|p| p.recovered = done_before.len());
     let by_id: HashMap<&str, &Item> = job.items.iter().map(|i| (i.i.as_str(), i)).collect();
     let mut ok: HashSet<String> = done_before.iter().map(|i| i.i.clone()).collect();
@@ -385,7 +399,6 @@ async fn place_icloud(
     placed: &[(usize, &Item)],
     rel: &[Vec<String>],
 ) -> Result<(), ApiError> {
-    let state = app.state::<AppState>();
     let mut groups: HashMap<Vec<String>, Vec<&Item>> = HashMap::new();
     for (idx, it) in placed {
         groups.entry(rel[*idx].clone()).or_default().push(it);
@@ -393,58 +406,65 @@ async fn place_icloud(
     let mut keys: Vec<_> = groups.keys().cloned().collect();
     keys.sort_by_key(|k| (k.len(), k.clone()));
 
+    // Make the folders one by one (a parent before its children), then move files in parallel.
     let mut cache = HashMap::new();
     let mut listed = HashMap::new();
-    for key in keys {
+    let mut moves: Vec<(String, &[&Item])> = Vec::new();
+    for key in &keys {
         if job.cancel.load(Ordering::Relaxed) {
             return Ok(());
         }
-        let items = &groups[&key];
-        let dir = match ensure_dir(app, &mut cache, &mut listed, root, &key).await {
-            Ok(d) => d,
+        let items = &groups[key];
+        match ensure_dir(app, &mut cache, &mut listed, root, key).await {
+            Ok(dir) => moves.extend(items.chunks(MOVE_BATCH).map(|c| (dir.clone(), c))),
             Err(e) if is_auth(&e) => return Err(e),
             Err(e) => {
                 for it in items {
                     rep.fail(it, format!("could not make folder {}: {e}", key.join("/")));
                 }
-                continue;
-            }
-        };
-        for chunk in items.chunks(MOVE_BATCH) {
-            if job.cancel.load(Ordering::Relaxed) {
-                return Ok(());
-            }
-            let by_ws: HashMap<String, &Item> = chunk.iter().map(|it| (file_drivewsid(it), *it)).collect();
-            let mut pending: Vec<(String, String)> = by_ws.keys().map(|k| (k.clone(), String::new())).collect();
-            // Recovered items can take a moment to show up in drivews: retry what failed.
-            for attempt in 0..3 {
-                if attempt > 0 {
-                    tokio::time::sleep(Duration::from_secs(2 * attempt)).await;
-                }
-                let failed = match state.icloud.move_items(&dir, &pending).await {
-                    Ok(f) => f,
-                    Err(e) if is_auth(&e) => return Err(e),
-                    Err(e) => pending.iter().map(|(id, _)| (id.clone(), e.to_string())).collect(),
-                };
-                let failed_ids: HashSet<&String> = failed.iter().map(|(id, _)| id).collect();
-                let moved = pending.iter().filter(|(id, _)| !failed_ids.contains(id)).count();
-                let moved_bytes: u64 = pending.iter().filter(|(id, _)| !failed_ids.contains(id)).filter_map(|(id, _)| by_ws.get(id)).map(|i| i.s).sum();
-                rep.bytes.fetch_add(moved_bytes, Ordering::Relaxed);
-                rep.update(|p| p.placed += moved);
-                if failed.is_empty() {
-                    pending.clear();
-                    break;
-                }
-                if attempt == 2 {
-                    for (id, msg) in &failed {
-                        if let Some(it) = by_ws.get(id) {
-                            rep.fail(it, format!("restored to original place, not moved: {msg}"));
-                        }
-                    }
-                }
-                pending = failed.into_iter().map(|(id, _)| (id, String::new())).collect();
             }
         }
+    }
+    let jobs: Vec<_> = moves.into_iter().map(|(dir, chunk)| Box::pin(move_chunk(app, job, rep, dir, chunk))).collect();
+    let mut results = stream::iter(jobs).buffer_unordered(MOVE_PAR);
+    while let Some(r) = results.next().await {
+        r?;
+    }
+    Ok(())
+}
+
+async fn move_chunk(app: &AppHandle, job: &Job, rep: &Arc<Reporter>, dir: String, chunk: &[&Item]) -> Result<(), ApiError> {
+    if job.cancel.load(Ordering::Relaxed) {
+        return Ok(());
+    }
+    let state = app.state::<AppState>();
+    let by_ws: HashMap<String, &Item> = chunk.iter().map(|it| (file_drivewsid(it), *it)).collect();
+    let mut pending: Vec<(String, String)> = by_ws.keys().map(|k| (k.clone(), String::new())).collect();
+    // Recovered items can take a moment to show up in drivews: retry what failed.
+    for attempt in 0..3 {
+        if attempt > 0 {
+            tokio::time::sleep(Duration::from_secs(2 * attempt)).await;
+        }
+        let failed = match state.icloud.move_items(&dir, &pending).await {
+            Ok(f) => f,
+            Err(e) if is_auth(&e) => return Err(e),
+            Err(e) => pending.iter().map(|(id, _)| (id.clone(), e.to_string())).collect(),
+        };
+        let failed_ids: HashSet<&String> = failed.iter().map(|(id, _)| id).collect();
+        let moved: Vec<&Item> = pending.iter().filter(|(id, _)| !failed_ids.contains(id)).filter_map(|(id, _)| by_ws.get(id).copied()).collect();
+        rep.bytes.fetch_add(moved.iter().map(|i| i.s).sum(), Ordering::Relaxed);
+        rep.update(|p| p.placed += moved.len());
+        if failed.is_empty() {
+            return Ok(());
+        }
+        if attempt == 2 {
+            for (id, msg) in &failed {
+                if let Some(it) = by_ws.get(id) {
+                    rep.fail(it, format!("restored to original place, not moved: {msg}"));
+                }
+            }
+        }
+        pending = failed.into_iter().map(|(id, _)| (id, String::new())).collect();
     }
     Ok(())
 }
@@ -517,7 +537,7 @@ async fn download_one(app: &AppHandle, rep: &Reporter, it: &Item, target: &Path,
         let attempt_result: Result<[u8; 32], ApiError> = async {
             let url = state.icloud.download_url(&it.z, &it.di).await?;
             let resp = state.icloud.download(&url).await?;
-            let mut file = tokio::fs::File::create(&tmp).await?;
+            let mut file = tokio::io::BufWriter::with_capacity(1 << 20, tokio::fs::File::create(&tmp).await?);
             let mut body = resp.bytes_stream();
             let mut h = Sha256::new();
             while let Some(chunk) = body.next().await {
@@ -530,7 +550,6 @@ async fn download_one(app: &AppHandle, rep: &Reporter, it: &Item, target: &Path,
                 rep.bytes.fetch_add(chunk.len() as u64, Ordering::Relaxed);
             }
             file.flush().await?;
-            file.sync_all().await?;
             Ok(h.finalize().into())
         }
         .await;

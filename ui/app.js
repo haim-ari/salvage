@@ -12,6 +12,7 @@ const ROW_H = 30;
 // ---------------- helpers ----------------
 const esc = (s) => String(s).replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
 const nf = new Intl.NumberFormat();
+const coll = new Intl.Collator(undefined, { numeric: true, sensitivity: "base" }).compare;
 const n = (x) => nf.format(x);
 const plural = (x, w) => `${n(x)} ${w}${x === 1 ? "" : "s"}`;
 function bytes(b) {
@@ -109,8 +110,9 @@ function saveDest() {
 function load(view) {
   if (!view) return;
   const snap = view.snapshot;
-  // Exact copies (same name and same bytes) are shown once.
-  S.items = snap.items.filter((it) => !it.u);
+  S.items = snap.items;
+  S.lc = null;
+  kindsCache = null;
   S.copiesChecked = !!snap.copiesChecked;
   S.folders = snap.folders;
   S.scannedAt = snap.scannedAt;
@@ -120,7 +122,7 @@ function load(view) {
 
   S.children = Array.from({ length: F }, () => []);
   for (let f = 1; f < F; f++) S.children[S.folders[f].parent].push(f);
-  for (const c of S.children) c.sort((a, b) => S.folders[a].name.localeCompare(S.folders[b].name, undefined, { numeric: true, sensitivity: "base" }));
+  for (const c of S.children) c.sort((a, b) => coll(S.folders[a].name, S.folders[b].name));
 
   // dfs position + subtree size per folder
   S.pos = new Int32Array(F);
@@ -158,6 +160,7 @@ function load(view) {
     S.B[k + 1] = S.B[k] + it.s;
     S.R[k + 1] = S.R[k] + d;
   }
+  countSoon();
   // keep selection of ids that still exist
   const prevSel = S.sel ? new Set(selectedIds()) : new Set();
   S.sel = new Uint8Array(N);
@@ -246,14 +249,16 @@ function filtersActive() { return !!(S.q || S.whenDays); }
 function matcher() {
   const q = S.q.toLowerCase();
   const since = S.whenDays ? Date.now() - S.whenDays * DAY : 0;
-  const hide = S.hide;
-  return (it) => !hide.has(it.e) && (!q || it.n.toLowerCase().includes(q)) && (!since || it.d >= since);
+  if (q && !S.lc) S.lc = S.items.map((it) => it.n.toLowerCase());
+  const lc = S.lc;
+  return (i) => !S.hid[i] && (!q || lc[i].includes(q)) && (!since || S.items[i].d >= since);
 }
 function itemCmp() {
   const { key, dir } = S.sort;
   const by = {
-    name: (a, b) => a.n.localeCompare(b.n, undefined, { numeric: true, sensitivity: "base" }),
-    loc: (a, b) => S.folders[a.f].path.localeCompare(S.folders[b.f].path) || a.n.localeCompare(b.n),
+    name: (a, b) => coll(a.n, b.n),
+    // folders are numbered in tree order, so no path strings to compare
+    loc: (a, b) => S.pos[a.f] - S.pos[b.f] || coll(a.n, b.n),
     size: (a, b) => a.s - b.s,
     mod: (a, b) => a.m - b.m,
     del: (a, b) => a.d - b.d,
@@ -273,13 +278,15 @@ function buildRows() {
     const [a, b] = directRange(S.cur);
     const its = Array.from(S.order.subarray(a, b)).filter((i) => !S.hid[i]).sort(itemCmp());
     for (const i of its) rows.push({ t: "i", i });
+    S.shown = its.length;
   } else {
     const m = matcher();
     const [a, b] = rangeOf(S.cur);
     const its = [];
-    for (let k = a; k < b; k++) { const i = S.order[k]; if (m(S.items[i])) its.push(i); }
+    for (let k = a; k < b; k++) { const i = S.order[k]; if (m(i)) its.push(i); }
     its.sort(itemCmp());
     for (const i of its) rows.push({ t: "i", i });
+    S.shown = its.length;
   }
   S.rows = rows;
   S.flat = flat;
@@ -287,9 +294,9 @@ function buildRows() {
 }
 
 // ---------------- render ----------------
-function renderAll() {
+function renderAll(reflatten = true) {
   buildRows();
-  renderTree();
+  renderTree(reflatten);
   renderKinds();
   renderCrumbs();
   renderHead();
@@ -305,6 +312,7 @@ function renderAll() {
 // The tree can have thousands of rows (one per deleted folder), so only the rows
 // you can see are drawn. TREE_ROWS is the flat list of open rows: [folder, depth].
 const TREE_H = 26;
+const TREE_FOLDER_SVG = FOLDER_SVG.replace('class="ficon"', 'class="ticon"');
 let TREE_ROWS = [];
 function flattenTree() {
   const out = [];
@@ -333,7 +341,7 @@ function renderTree(reflatten = true) {
     out.push(`<div class="tree-row${f === S.cur ? " active" : ""}" data-f="${f}" style="padding-left:${4 + depth * 14}px">
       <span class="disc${ch.length ? (open ? " open" : "") : " none"}" data-act="disc">${DISC_SVG}</span>
       <span class="check ${folderState(f)}" data-act="check"></span>
-      ${f === 0 ? `<span class="ticon" style="color:var(--folder)">${CLOUD_SVG}</span>` : FOLDER_SVG.replace('class="ficon"', 'class="ticon"')}
+      ${f === 0 ? `<span class="ticon" style="color:var(--folder)">${CLOUD_SVG}</span>` : TREE_FOLDER_SVG}
       <span class="tname">${esc(S.folders[f].name)}</span>
       <span class="tcount">${n(subCount(f))}</span>
     </div>`);
@@ -352,16 +360,22 @@ function revealInTree(f) {
 }
 
 // Every file type in the open folder (and below), with a checkbox to show or hide it.
-function renderKinds() {
+let kindsCache = null;
+function kindsHere() {
+  if (kindsCache && kindsCache.cur === S.cur) return kindsCache.all;
   const counts = new Map();
   const [a, b] = rangeOf(S.cur);
   for (let k = a; k < b; k++) {
     const it = S.items[S.order[k]];
-    const c = counts.get(it.e) || [0, 0];
-    c[0]++; c[1] += it.s;
-    counts.set(it.e, c);
+    const c = counts.get(it.e);
+    if (c) { c[0]++; c[1] += it.s; } else counts.set(it.e, [1, it.s]);
   }
   const all = [...counts.entries()].sort((x, y) => y[1][0] - x[1][0]);
+  kindsCache = { cur: S.cur, all };
+  return all;
+}
+function renderKinds() {
+  const all = kindsHere();
   const hiddenHere = all.filter(([e]) => S.hide.has(e)).length;
   $("kinds-sub").textContent = all.length ? `${all.length - hiddenHere} of ${all.length} shown` : "";
   const kq = ($("kinds-q").value || "").trim().toLowerCase().replace(/^\./, "");
@@ -466,18 +480,17 @@ function destLabel(d) {
   return "Where they were";
 }
 
+function countSoon() {
+  const limit = Date.now() - (KEEP_DAYS - 3) * DAY;
+  let soon = 0;
+  for (let i = 0; i < S.items.length; i++) { const d = S.items[i].d; if (d && d < limit && !S.done[i]) soon++; }
+  S.soon = soon;
+}
 function renderStatus() {
   const total = S.items.length;
-  const left = total - S.restored.size;
-  let soon = 0;
-  const now = Date.now();
-  for (let i = 0; i < total; i++) {
-    const it = S.items[i];
-    if (!S.done[i] && it.d && it.d + KEEP_DAYS * DAY - now < 3 * DAY) soon++;
-  }
-  const shown = S.rows.filter((r) => r.t === "i").length;
-  $("statusbar").textContent =
-    `${plural(shown, "file")} shown · ${n(left)} of ${n(total)} still deleted` + (soon ? ` · ${n(soon)} gone in under 3 days` : "");
+  const left = total - S.R[total];
+  $("status-text").textContent =
+    `${plural(S.shown, "file")} shown · ${n(left)} of ${n(total)} still deleted` + (S.soon ? ` · ${n(S.soon)} gone in under 3 days` : "");
 }
 
 function renderAccount() {
@@ -532,10 +545,11 @@ function go(f) {
   $("scroller").scrollTop = 0;
   flattenTree();
   revealInTree(f);
-  renderAll();
+  renderAll(false);
 }
 function setCursor(r, scroll = true) {
   if (!S.rows.length) return;
+  const prev = S.cursor;
   S.cursor = Math.max(0, Math.min(S.rows.length - 1, r));
   if (scroll) {
     const sc = $("scroller");
@@ -543,7 +557,12 @@ function setCursor(r, scroll = true) {
     if (top < sc.scrollTop) sc.scrollTop = top;
     else if (top + ROW_H > sc.scrollTop + sc.clientHeight - 90) sc.scrollTop = top + ROW_H - sc.clientHeight + 90;
   }
-  renderRows(true);
+  const drawn = lastRange;
+  renderRows(false);
+  if (lastRange === drawn) {
+    $("rows").querySelector(`[data-r="${prev}"]`)?.classList.remove("cursor");
+    $("rows").querySelector(`[data-r="${S.cursor}"]`)?.classList.add("cursor");
+  }
   renderInspector();
 }
 function toggleRow(r, on) {
@@ -620,7 +639,8 @@ function ovKey(i) {
   for (let f = i; f > 0; f = O.folders[f].parent) parts.push(O.folders[f].name);
   return parts.reverse().join("/");
 }
-function renderOverview() {
+// Progress events change only the status line, so they redraw only that.
+function renderOvState() {
   if ($("overview").hidden) return;
   $("ov-files").textContent = plural(O.files, "file");
   $("ov-bytes").textContent = gb(O.bytes);
@@ -630,6 +650,16 @@ function renderOverview() {
   else if (O.scanning) st.innerHTML = `<span class="pill wait"><span class="mini"></span>Finding files</span><span>${esc(O.progress)}</span>`;
   else st.innerHTML = `<span class="pill wait">Not complete</span><span>The scan stopped. Use Scan again.</span>`;
   $("btn-browse").disabled = !O.complete || !!O.checking || !S.items.length;
+}
+// Many folder events can come close together: draw the table at most 20 times a second.
+// A timer, not a frame callback, so a window behind other windows still updates.
+let ovTimer = 0;
+function scheduleOverview() {
+  if (!ovTimer) ovTimer = setTimeout(() => { ovTimer = 0; renderOverview(); }, 50);
+}
+function renderOverview() {
+  if ($("overview").hidden) return;
+  renderOvState();
 
   const F = O.folders.length;
   const kids = Array.from({ length: F }, () => []);
@@ -640,7 +670,7 @@ function renderOverview() {
     if (last(A) !== last(B)) return last(A) - last(B);
     // groups of a deleted folder: biggest first
     if (O.folders[a].hint) return O.folders[b].files - O.folders[a].files;
-    return A.localeCompare(B, undefined, { numeric: true, sensitivity: "base" });
+    return coll(A, B);
   };
   for (let i = 0; i < F; i++) kids[i] = kids[i].filter((c) => O.folders[c].files > 0);
   kids.forEach((k) => k.sort(cmp));
@@ -802,6 +832,26 @@ function modal(html) {
   return root.querySelector(".sheet");
 }
 const closeModal = () => ($("modal-root").innerHTML = "");
+// A small yes/no sheet. Enter says yes, Escape says no.
+function ask(title, text, yes, run, danger = false) {
+  const sheet = modal(`<div class="sheet-head"><h2>${esc(title)}</h2><p>${esc(text)}</p></div>
+    <div class="sheet-foot"><span class="grow"></span><button class="btn" id="ask-no">Cancel</button><button class="btn primary${danger ? " danger" : ""}" id="ask-yes">${esc(yes)}</button></div>`);
+  sheet.querySelector("#ask-no").onclick = closeModal;
+  sheet.querySelector("#ask-yes").onclick = () => { closeModal(); run(); };
+  sheet.querySelector("#ask-yes").focus();
+}
+const KEYS = [
+  ["↑ ↓", "Move up and down"], ["Space", "Select or clear the file"], ["Shift-click", "Select a range"],
+  ["⏎ or →", "Open the folder"], ["⌫ or ←", "Go up one folder"], ["⌘A", "Select all shown"], ["⇧⌘A", "Clear all shown"],
+  ["⌘F", "Search"], ["⌘I", "Show file info"], ["⌘R", "Restore the selected files"], ["Esc", "Clear search, then selection"], ["?", "This list"],
+];
+function showKeys() {
+  const sheet = modal(`<div class="sheet-head"><h2>Keyboard shortcuts</h2></div>
+    <div class="sheet-body"><dl class="keys">${KEYS.map(([k, v]) => `<dt><kbd>${k}</kbd></dt><dd>${v}</dd>`).join("")}</dl></div>
+    <div class="sheet-foot"><span class="grow"></span><button class="btn primary" id="keys-ok">Done</button></div>`);
+  sheet.querySelector("#keys-ok").onclick = closeModal;
+  sheet.querySelector("#keys-ok").focus();
+}
 const modalOpen = () => !!$("modal-root").firstChild;
 
 function chooseDestination() {
@@ -925,12 +975,25 @@ function progressSheet() {
 
 function onProgress(p) {
   const job = S.job;
-  if (!job || !$("rp-bar")) return;
+  if (!job) return;
   job.last = p;
+  // An empty list means "no new failures", so keep the last full list.
+  if (p.failures.length) job.failures = p.failures;
   const now = performance.now();
   const units = p.phase === "recover" ? p.recovered + p.failed : p.placed + p.failed;
   job.samples.push({ t: now, u: units, b: p.bytes, ph: p.phase });
   while (job.samples.length > 2 && now - job.samples[0].t > 4000) job.samples.shift();
+  if (!job.timer) job.timer = setTimeout(drawProgress, 50);
+}
+
+function drawProgress() {
+  const job = S.job;
+  if (!job) return;
+  job.timer = 0;
+  if (!$("rp-bar")) return;
+  const p = job.last;
+  const now = performance.now();
+  const units = p.phase === "recover" ? p.recovered + p.failed : p.placed + p.failed;
   const s0 = job.samples.find((s) => s.ph === p.phase) || job.samples[0];
   const dt = (now - s0.t) / 1000;
   const rate = dt > 0.3 ? (units - s0.u) / dt : 0;
@@ -961,8 +1024,10 @@ function onProgress(p) {
   $("rp-stats").innerHTML = stats.map(([k, v]) => `<dt>${k}</dt><dd>${v}</dd>`).join("");
   $("rp-sub").textContent = destLabel(job.dest);
 
-  if (p.failures.length) {
-    $("rp-fails").innerHTML = `<div class="fails">${p.failures.slice(0, 200).map((f) => `<div><b>${esc(f.name)}</b><span title="${esc(f.error)}">${esc(f.error)}</span></div>`).join("")}</div>`;
+  if (job.failures && job.failures !== job.failsDrawn) {
+    job.failsDrawn = job.failures;
+    const more = job.failures.length > 200 ? `<div><b>…</b><span>and ${n(job.failures.length - 200)} more</span></div>` : "";
+    $("rp-fails").innerHTML = `<div class="fails">${job.failures.slice(0, 200).map((f) => `<div><b>${esc(f.name)}</b><span title="${esc(f.error)}">${esc(f.error)}</span></div>`).join("")}${more}</div>`;
   }
   if (p.error) $("rp-fails").insertAdjacentHTML("afterbegin", `<div class="note" style="color:var(--danger)">${esc(p.error)}</div>`);
 
@@ -1023,13 +1088,15 @@ function wire() {
   $("btn-browse").onclick = () => { showMain(); go(0); };
   $("ov-rows").onclick = onOverviewClick;
   $("btn-restore").onclick = confirmRestore;
+  $("btn-keys").onclick = showKeys;
   $("btn-clear").onclick = () => selectAllShownGlobal(false);
   $("check-all").onclick = () => { const on = $("check-all").classList.contains("on"); selectAllShown(!on); };
   $("btn-menu").onclick = () =>
     openMenu($("btn-menu"), [
-      { label: "Scan again", sub: "Reads the whole list from Apple again (about 25 min)", run: () => scan(true) },
+      { label: "Scan again", sub: "Reads the whole list from Apple again", run: () => ask("Scan again?", "Salvage asks Apple for the whole list again. This can take a long time if you have many deleted files.", "Scan Again", () => scan(true)) },
+      { label: "Keyboard shortcuts", sub: "Press ? at any time", run: showKeys },
       "-",
-      { label: "Sign out", sub: "Removes the session and cache from this Mac", run: async () => { await invoke("sign_out"); } },
+      { label: "Sign out", sub: "Removes the session and cache from this Mac", run: () => ask("Sign out?", "Salvage removes your sign-in and the saved list from this Mac. Next time, it must scan again.", "Sign Out", () => invoke("sign_out"), true) },
     ], { above: true });
 
   document.querySelectorAll(".thead .sortable").forEach((h) => {
@@ -1063,8 +1130,7 @@ function wire() {
     const next = new Set(S.hide);
     if (e.altKey) {
       // show only this type: hide every other type in this folder
-      const [a, b] = rangeOf(S.cur);
-      for (let k = a; k < b; k++) next.add(S.items[S.order[k]].e);
+      for (const [e] of kindsHere()) next.add(e);
       next.delete(ext);
     } else if (next.has(ext)) next.delete(ext);
     else next.add(ext);
@@ -1072,14 +1138,12 @@ function wire() {
   };
   $("kinds-all").onclick = () => {
     const next = new Set(S.hide);
-    const [a, b] = rangeOf(S.cur);
-    for (let k = a; k < b; k++) next.delete(S.items[S.order[k]].e);
+    for (const [e] of kindsHere()) next.delete(e);
     setHide(next);
   };
   $("kinds-none").onclick = () => {
     const next = new Set(S.hide);
-    const [a, b] = rangeOf(S.cur);
-    for (let k = a; k < b; k++) next.add(S.items[S.order[k]].e);
+    for (const [e] of kindsHere()) next.add(e);
     setHide(next);
   };
 
@@ -1126,6 +1190,7 @@ function wire() {
 
   document.addEventListener("keydown", (e) => {
     const cmd = e.metaKey || e.ctrlKey;
+    if (!$("menu").hidden && e.key === "Escape") { $("menu").hidden = true; return; }
     if (modalOpen()) {
       if (e.key === "Escape" && !S.job) closeModal();
       return;
@@ -1136,6 +1201,7 @@ function wire() {
     if (cmd && e.key === "i") { e.preventDefault(); $("btn-inspector").click(); return; }
     if (cmd && e.key === "r") { e.preventDefault(); confirmRestore(); return; }
     if (inField) return;
+    if (e.key === "?") { e.preventDefault(); showKeys(); return; }
     if (cmd && e.key === "a") { e.preventDefault(); selectAllShown(!e.shiftKey); return; }
     if (cmd && e.key === "ArrowUp") { e.preventDefault(); go(S.folders[S.cur].parent); return; }
     switch (e.key) {
@@ -1175,7 +1241,7 @@ async function boot() {
       ? `Finding folder names${p.total ? ` (${n(p.done)} of ${n(p.total)})` : ""}…`
       : `Apple has sent ${plural(p.count, "file")} so far…`;
     if (!$("gate").hidden) $("gate-progress-text").textContent = O.progress;
-    renderOverview();
+    renderOvState();
   });
   await listen("scan://folders", (p) => {
     O.folders = p.folders;
@@ -1183,12 +1249,12 @@ async function boot() {
     O.bytes = p.bytes;
     O.complete = false; // the snapshot load sets this when the scan returns
     O.map = null;
-    renderOverview();
+    scheduleOverview();
   });
   await listen("restore://progress", onProgress);
   await listen("copies://progress", (p) => {
     O.progress = `Checking for exact copies (${n(p.done)} of ${n(p.total)})…`;
-    renderOverview();
+    renderOvState();
   });
   setInterval(renderAccount, 60000);
 

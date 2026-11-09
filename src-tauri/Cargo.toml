@@ -1,6 +1,6 @@
 [package]
 name = "salvage"
-version = "0.1.1"
+version = "0.2.0"
 edition = "2021"
 description = "Fast native restore client for iCloud Drive deleted files"
 license = "MIT"
@@ -22,7 +22,6 @@ futures = "0.3"
 thiserror = "2"
 uuid = { version = "1", features = ["v4"] }
 url = "2"
-filetime = "0.2"
 parking_lot = "0.12"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["json", "env-filter"] }
