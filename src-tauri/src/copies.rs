@@ -11,7 +11,10 @@ pub fn mark(snap: &mut Snapshot) -> usize {
     let mut groups: HashMap<(String, u64, i64), Vec<usize>> = HashMap::new();
     for (i, it) in snap.items.iter().enumerate() {
         if it.m > 0 {
-            groups.entry((it.n.clone(), it.s, it.m)).or_default().push(i);
+            groups
+                .entry((it.n.clone(), it.s, it.m))
+                .or_default()
+                .push(i);
         }
     }
     for it in snap.items.iter_mut() {
@@ -23,7 +26,11 @@ pub fn mark(snap: &mut Snapshot) -> usize {
         // Show the one whose folder is known, then the shortest path.
         same.sort_by_key(|&i| {
             let path = &snap.folders[snap.items[i].f as usize].path;
-            (path.starts_with(GROUPS), path.len(), snap.items[i].i.clone())
+            (
+                path.starts_with(GROUPS),
+                path.len(),
+                snap.items[i].i.clone(),
+            )
         });
         let keep = snap.items[same[0]].i.clone();
         for &i in &same[1..] {

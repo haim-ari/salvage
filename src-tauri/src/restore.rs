@@ -9,6 +9,7 @@ use futures::{stream, StreamExt};
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use sha2::{Digest, Sha256};
 use std::{
     collections::{HashMap, HashSet},
     path::{Path, PathBuf},
@@ -19,7 +20,6 @@ use std::{
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 use tauri::{AppHandle, Emitter, Manager};
-use sha2::{Digest, Sha256};
 use tokio::io::AsyncWriteExt;
 
 use crate::api::{ApiError, DEFAULT_ZONE};
@@ -33,16 +33,33 @@ const RECOVER_RETRIES: u32 = 6;
 /// Apple errors that go away if we wait and ask again.
 fn is_transient(msg: &str) -> bool {
     let m = msg.to_ascii_uppercase();
-    ["OVERLOAD", "THROTTL", "TRY_AGAIN", "RETRY", "UNAVAILABLE", "TIMED OUT", "TIMEOUT", "503", "502", "504", "429", "STATUS 5"]
-        .iter()
-        .any(|k| m.contains(k))
+    [
+        "OVERLOAD",
+        "THROTTL",
+        "TRY_AGAIN",
+        "RETRY",
+        "UNAVAILABLE",
+        "TIMED OUT",
+        "TIMEOUT",
+        "503",
+        "502",
+        "504",
+        "429",
+        "STATUS 5",
+    ]
+    .iter()
+    .any(|k| m.contains(k))
 }
 const MOVE_BATCH: usize = 200;
 const DOWNLOAD_PAR: usize = 12;
 const MOVE_PAR: usize = 4;
 
 #[derive(Deserialize, Clone, Debug)]
-#[serde(tag = "kind", rename_all = "camelCase", rename_all_fields = "camelCase")]
+#[serde(
+    tag = "kind",
+    rename_all = "camelCase",
+    rename_all_fields = "camelCase"
+)]
 pub enum Destination {
     Original,
     Icloud {
@@ -50,7 +67,9 @@ pub enum Destination {
         #[allow(dead_code)]
         path: String,
     },
-    Local { path: String },
+    Local {
+        path: String,
+    },
 }
 
 #[derive(Serialize, Clone, Debug)]
@@ -98,7 +117,11 @@ impl Reporter {
         self.update(|p| {
             p.failed += 1;
             if p.failures.len() < 500 {
-                p.failures.push(Failure { id: it.i.clone(), name: it.n.clone(), error });
+                p.failures.push(Failure {
+                    id: it.i.clone(),
+                    name: it.n.clone(),
+                    error,
+                });
             }
         });
     }
@@ -120,7 +143,10 @@ impl Reporter {
             p.failures = failures;
             snap
         };
-        let snap = Progress { bytes: self.bytes.load(Ordering::Relaxed), ..snap };
+        let snap = Progress {
+            bytes: self.bytes.load(Ordering::Relaxed),
+            ..snap
+        };
         let _ = self.app.emit("restore://progress", snap);
     }
 }
@@ -134,7 +160,10 @@ pub struct Job {
 }
 
 fn components(path: &str) -> Vec<String> {
-    path.split('/').filter(|s| !s.is_empty()).map(str::to_string).collect()
+    path.split('/')
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .collect()
 }
 
 /// Relative folder (as components) for each item under the destination.
@@ -145,8 +174,17 @@ pub fn relative_dirs(items: &[Item], folders: &[Folder]) -> Vec<Vec<String>> {
 }
 
 fn dirs_of(fs: impl Iterator<Item = u32>, folders: &[Folder]) -> Vec<Vec<String>> {
-    let paths: Vec<Vec<String>> = fs.map(|f| folders.get(f as usize).map(|f| components(&f.path)).unwrap_or_default()).collect();
-    let Some(first) = paths.first() else { return Vec::new() };
+    let paths: Vec<Vec<String>> = fs
+        .map(|f| {
+            folders
+                .get(f as usize)
+                .map(|f| components(&f.path))
+                .unwrap_or_default()
+        })
+        .collect();
+    let Some(first) = paths.first() else {
+        return Vec::new();
+    };
     if paths.iter().all(|p| p == first) {
         return vec![Vec::new(); paths.len()];
     }
@@ -161,13 +199,23 @@ fn dirs_of(fs: impl Iterator<Item = u32>, folders: &[Folder]) -> Vec<Vec<String>
 /// Like `relative_dirs`, but a hidden copy goes in the same folder as the file shown for
 /// it, so copies never change the folder layout of what the person picked.
 fn rel_with_copies(items: &[Item], folders: &[Folder]) -> Vec<Vec<String>> {
-    let shown: Vec<usize> = (0..items.len()).filter(|&i| items[i].o.is_empty()).collect();
+    let shown: Vec<usize> = (0..items.len())
+        .filter(|&i| items[i].o.is_empty())
+        .collect();
     let rel_shown = dirs_of(shown.iter().map(|&i| items[i].f), folders);
-    let by_id: HashMap<&str, Vec<String>> = shown.iter().map(|&i| items[i].i.as_str()).zip(rel_shown).collect();
+    let by_id: HashMap<&str, Vec<String>> = shown
+        .iter()
+        .map(|&i| items[i].i.as_str())
+        .zip(rel_shown)
+        .collect();
     items
         .iter()
         .map(|it| {
-            let key = if it.o.is_empty() { it.i.as_str() } else { it.o.as_str() };
+            let key = if it.o.is_empty() {
+                it.i.as_str()
+            } else {
+                it.o.as_str()
+            };
             by_id.get(key).cloned().unwrap_or_default()
         })
         .collect()
@@ -308,7 +356,12 @@ async fn execute(app: &AppHandle, job: &Job, rep: &Arc<Reporter>) -> Result<(), 
         return Ok(());
     }
 
-    let placed: Vec<(usize, &Item)> = job.items.iter().enumerate().filter(|(_, i)| ok.contains(&i.i)).collect();
+    let placed: Vec<(usize, &Item)> = job
+        .items
+        .iter()
+        .enumerate()
+        .filter(|(_, i)| ok.contains(&i.i))
+        .collect();
     let rel = rel_with_copies(&job.items, &job.folders);
 
     match &job.dest {
@@ -317,13 +370,15 @@ async fn execute(app: &AppHandle, job: &Job, rep: &Arc<Reporter>) -> Result<(), 
                 p.placed = placed.len();
                 p.bytes = 0;
             });
-            rep.bytes.store(placed.iter().map(|(_, i)| i.s).sum(), Ordering::Relaxed);
+            rep.bytes
+                .store(placed.iter().map(|(_, i)| i.s).sum(), Ordering::Relaxed);
             Ok(())
         }
         Destination::Icloud { drivewsid, .. } => {
             rep.update(|p| p.phase = "move".into());
             // Hidden copies stay where they were in iCloud; only the shown files move.
-            let placed: Vec<(usize, &Item)> = placed.into_iter().filter(|(_, i)| i.o.is_empty()).collect();
+            let placed: Vec<(usize, &Item)> =
+                placed.into_iter().filter(|(_, i)| i.o.is_empty()).collect();
             place_icloud(app, job, rep, drivewsid, &placed, &rel).await
         }
         Destination::Local { path } => {
@@ -344,7 +399,12 @@ fn child_folders(entry: &Value) -> Vec<(String, String)> {
         .map(|a| {
             a.iter()
                 .filter(|x| matches!(x["type"].as_str(), Some("FOLDER") | Some("APP_LIBRARY")))
-                .filter_map(|x| Some((x["name"].as_str()?.to_string(), x["drivewsid"].as_str()?.to_string())))
+                .filter_map(|x| {
+                    Some((
+                        x["name"].as_str()?.to_string(),
+                        x["drivewsid"].as_str()?.to_string(),
+                    ))
+                })
                 .collect()
         })
         .unwrap_or_default()
@@ -368,14 +428,23 @@ async fn ensure_dir(
         let name = &rel[depth - 1];
         if !listed.contains_key(&parent) {
             let entries = state.icloud.folders(&[parent.clone()], false).await?;
-            listed.insert(parent.clone(), entries.first().map(child_folders).unwrap_or_default());
+            listed.insert(
+                parent.clone(),
+                entries.first().map(child_folders).unwrap_or_default(),
+            );
         }
-        let existing = listed[&parent].iter().find(|(n, _)| n == name).map(|(_, id)| id.clone());
+        let existing = listed[&parent]
+            .iter()
+            .find(|(n, _)| n == name)
+            .map(|(_, id)| id.clone());
         let id = match existing {
             Some(id) => id,
             None => {
                 let id = state.icloud.create_folder(&parent, name).await?;
-                listed.get_mut(&parent).expect("listed").push((name.clone(), id.clone()));
+                listed
+                    .get_mut(&parent)
+                    .expect("listed")
+                    .push((name.clone(), id.clone()));
                 listed.insert(id.clone(), Vec::new());
                 id
             }
@@ -425,7 +494,10 @@ async fn place_icloud(
             }
         }
     }
-    let jobs: Vec<_> = moves.into_iter().map(|(dir, chunk)| Box::pin(move_chunk(app, job, rep, dir, chunk))).collect();
+    let jobs: Vec<_> = moves
+        .into_iter()
+        .map(|(dir, chunk)| Box::pin(move_chunk(app, job, rep, dir, chunk)))
+        .collect();
     let mut results = stream::iter(jobs).buffer_unordered(MOVE_PAR);
     while let Some(r) = results.next().await {
         r?;
@@ -433,13 +505,20 @@ async fn place_icloud(
     Ok(())
 }
 
-async fn move_chunk(app: &AppHandle, job: &Job, rep: &Arc<Reporter>, dir: String, chunk: &[&Item]) -> Result<(), ApiError> {
+async fn move_chunk(
+    app: &AppHandle,
+    job: &Job,
+    rep: &Arc<Reporter>,
+    dir: String,
+    chunk: &[&Item],
+) -> Result<(), ApiError> {
     if job.cancel.load(Ordering::Relaxed) {
         return Ok(());
     }
     let state = app.state::<AppState>();
     let by_ws: HashMap<String, &Item> = chunk.iter().map(|it| (file_drivewsid(it), *it)).collect();
-    let mut pending: Vec<(String, String)> = by_ws.keys().map(|k| (k.clone(), String::new())).collect();
+    let mut pending: Vec<(String, String)> =
+        by_ws.keys().map(|k| (k.clone(), String::new())).collect();
     // Recovered items can take a moment to show up in drivews: retry what failed.
     for attempt in 0..3 {
         if attempt > 0 {
@@ -448,11 +527,19 @@ async fn move_chunk(app: &AppHandle, job: &Job, rep: &Arc<Reporter>, dir: String
         let failed = match state.icloud.move_items(&dir, &pending).await {
             Ok(f) => f,
             Err(e) if is_auth(&e) => return Err(e),
-            Err(e) => pending.iter().map(|(id, _)| (id.clone(), e.to_string())).collect(),
+            Err(e) => pending
+                .iter()
+                .map(|(id, _)| (id.clone(), e.to_string()))
+                .collect(),
         };
         let failed_ids: HashSet<&String> = failed.iter().map(|(id, _)| id).collect();
-        let moved: Vec<&Item> = pending.iter().filter(|(id, _)| !failed_ids.contains(id)).filter_map(|(id, _)| by_ws.get(id).copied()).collect();
-        rep.bytes.fetch_add(moved.iter().map(|i| i.s).sum(), Ordering::Relaxed);
+        let moved: Vec<&Item> = pending
+            .iter()
+            .filter(|(id, _)| !failed_ids.contains(id))
+            .filter_map(|(id, _)| by_ws.get(id).copied())
+            .collect();
+        rep.bytes
+            .fetch_add(moved.iter().map(|i| i.s).sum(), Ordering::Relaxed);
         rep.update(|p| p.placed += moved.len());
         if failed.is_empty() {
             return Ok(());
@@ -464,7 +551,10 @@ async fn move_chunk(app: &AppHandle, job: &Job, rep: &Arc<Reporter>, dir: String
                 }
             }
         }
-        pending = failed.into_iter().map(|(id, _)| (id, String::new())).collect();
+        pending = failed
+            .into_iter()
+            .map(|(id, _)| (id, String::new()))
+            .collect();
     }
     Ok(())
 }
@@ -479,7 +569,11 @@ fn unique_path(dir: &Path, name: &str, taken: &Mutex<HashSet<PathBuf>>) -> PathB
     let mut taken = taken.lock();
     let mut n = 1;
     loop {
-        let candidate = if n == 1 { dir.join(name) } else { dir.join(format!("{stem} {n}{ext}")) };
+        let candidate = if n == 1 {
+            dir.join(name)
+        } else {
+            dir.join(format!("{stem} {n}{ext}"))
+        };
         if !candidate.exists() && !taken.contains(&candidate) {
             taken.insert(candidate.clone());
             return candidate;
@@ -489,8 +583,15 @@ fn unique_path(dir: &Path, name: &str, taken: &Mutex<HashSet<PathBuf>>) -> PathB
 }
 
 fn safe_component(s: &str) -> String {
-    let c: String = s.chars().map(|c| if c == '/' || c == '\0' { '_' } else { c }).collect();
-    if c == "." || c == ".." || c.is_empty() { "_".into() } else { c }
+    let c: String = s
+        .chars()
+        .map(|c| if c == '/' || c == '\0' { '_' } else { c })
+        .collect();
+    if c == "." || c == ".." || c.is_empty() {
+        "_".into()
+    } else {
+        c
+    }
 }
 
 fn ms_to_time(ms: i64) -> Option<SystemTime> {
@@ -522,7 +623,13 @@ fn set_meta(path: &Path, it: &Item) -> std::io::Result<()> {
 }
 
 /// Download one file. Returns the SHA-256 of its bytes.
-async fn download_one(app: &AppHandle, rep: &Reporter, it: &Item, target: &Path, cancel: &AtomicBool) -> Result<[u8; 32], ApiError> {
+async fn download_one(
+    app: &AppHandle,
+    rep: &Reporter,
+    it: &Item,
+    target: &Path,
+    cancel: &AtomicBool,
+) -> Result<[u8; 32], ApiError> {
     let state = app.state::<AppState>();
     let dir = target.parent().expect("parent");
     let tmp = dir.join(format!(".salvage-{}.part", uuid::Uuid::new_v4()));
@@ -537,7 +644,8 @@ async fn download_one(app: &AppHandle, rep: &Reporter, it: &Item, target: &Path,
         let attempt_result: Result<[u8; 32], ApiError> = async {
             let url = state.icloud.download_url(&it.z, &it.di).await?;
             let resp = state.icloud.download(&url).await?;
-            let mut file = tokio::io::BufWriter::with_capacity(1 << 20, tokio::fs::File::create(&tmp).await?);
+            let mut file =
+                tokio::io::BufWriter::with_capacity(1 << 20, tokio::fs::File::create(&tmp).await?);
             let mut body = resp.bytes_stream();
             let mut h = Sha256::new();
             while let Some(chunk) = body.next().await {
@@ -630,7 +738,9 @@ async fn place_local(
     let hashes = hashes.into_inner();
     let (mut same, mut different) = (0usize, 0usize);
     for (_, it) in placed.iter().filter(|(_, i)| !i.o.is_empty()) {
-        let (Some((hc, path)), Some((hk, _))) = (hashes.get(&it.i), hashes.get(&it.o)) else { continue };
+        let (Some((hc, path)), Some((hk, _))) = (hashes.get(&it.i), hashes.get(&it.o)) else {
+            continue;
+        };
         if hc == hk {
             if std::fs::remove_file(path).is_ok() {
                 same += 1;
@@ -653,15 +763,47 @@ mod tests {
     use super::*;
 
     fn item(f: u32) -> Item {
-        Item { i: "i".into(), di: "d".into(), z: String::new(), p: String::new(), n: "a.py".into(), e: "py".into(), s: 1, d: 0, m: 0, c: 0, f, x: false, t: String::new(), u: false, o: String::new() }
+        Item {
+            i: "i".into(),
+            di: "d".into(),
+            z: String::new(),
+            p: String::new(),
+            n: "a.py".into(),
+            e: "py".into(),
+            s: 1,
+            d: 0,
+            m: 0,
+            c: 0,
+            f,
+            x: false,
+            t: String::new(),
+            u: false,
+            o: String::new(),
+        }
     }
 
     fn folders() -> Vec<Folder> {
         vec![
-            Folder { name: "iCloud Drive".into(), parent: -1, path: String::new() },
-            Folder { name: "Code".into(), parent: 0, path: "Code".into() },
-            Folder { name: "proj".into(), parent: 1, path: "Code/proj".into() },
-            Folder { name: "src".into(), parent: 2, path: "Code/proj/src".into() },
+            Folder {
+                name: "iCloud Drive".into(),
+                parent: -1,
+                path: String::new(),
+            },
+            Folder {
+                name: "Code".into(),
+                parent: 0,
+                path: "Code".into(),
+            },
+            Folder {
+                name: "proj".into(),
+                parent: 1,
+                path: "Code/proj".into(),
+            },
+            Folder {
+                name: "src".into(),
+                parent: 2,
+                path: "Code/proj/src".into(),
+            },
         ]
     }
 
@@ -680,7 +822,8 @@ mod tests {
 
     #[test]
     fn destination_json() {
-        let d: Destination = serde_json::from_str(r#"{"kind":"icloud","drivewsid":"X","path":"/a"}"#).unwrap();
+        let d: Destination =
+            serde_json::from_str(r#"{"kind":"icloud","drivewsid":"X","path":"/a"}"#).unwrap();
         assert!(matches!(d, Destination::Icloud { .. }));
         let d: Destination = serde_json::from_str(r#"{"kind":"original"}"#).unwrap();
         assert!(matches!(d, Destination::Original));
@@ -702,7 +845,10 @@ mod tests {
 
     #[test]
     fn marks_copies_once() {
-        let mut snap = crate::model::Snapshot { folders: folders(), ..Default::default() };
+        let mut snap = crate::model::Snapshot {
+            folders: folders(),
+            ..Default::default()
+        };
         let mut a = item(3);
         a.i = "a".into();
         a.m = 5;

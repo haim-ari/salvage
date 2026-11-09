@@ -69,7 +69,10 @@ fn transport() -> Transport {
     let jar = Arc::new(Jar::default());
     let mut h = header::HeaderMap::new();
     h.insert(header::ORIGIN, header::HeaderValue::from_static(ORIGIN));
-    h.insert(header::REFERER, header::HeaderValue::from_static("https://www.icloud.com/"));
+    h.insert(
+        header::REFERER,
+        header::HeaderValue::from_static("https://www.icloud.com/"),
+    );
     h.insert(header::ACCEPT, header::HeaderValue::from_static("*/*"));
     let http = Client::builder()
         .cookie_provider(jar.clone())
@@ -99,15 +102,17 @@ pub struct RawCookie {
 
 async fn check(resp: Response) -> ApiResult<Response> {
     let status = resp.status();
-    if matches!(status, StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN)
-        || status.as_u16() == 421
+    if matches!(status, StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN) || status.as_u16() == 421
     {
         return Err(ApiError::AuthExpired);
     }
     if !status.is_success() {
         let mut body = resp.text().await.unwrap_or_default();
         body.truncate(300);
-        return Err(ApiError::Status { status: status.as_u16(), body });
+        return Err(ApiError::Status {
+            status: status.as_u16(),
+            body,
+        });
     }
     Ok(resp)
 }
@@ -126,7 +131,10 @@ fn host_url(u: &str) -> String {
 
 impl Icloud {
     pub fn new() -> Self {
-        Self { t: RwLock::new(transport()), session: RwLock::new(None) }
+        Self {
+            t: RwLock::new(transport()),
+            session: RwLock::new(None),
+        }
     }
 
     fn http(&self) -> Client {
@@ -155,10 +163,15 @@ impl Icloud {
             if !(d.ends_with("icloud.com") || d.ends_with("apple.com")) {
                 continue;
             }
-            let Ok(url) = Url::parse(&format!("https://{d}/")) else { continue };
+            let Ok(url) = Url::parse(&format!("https://{d}/")) else {
+                continue;
+            };
             let path = if c.path.is_empty() { "/" } else { &c.path };
             fresh.jar.add_cookie_str(
-                &format!("{}={}; Domain=.{}; Path={}; Secure", c.name, c.value, d, path),
+                &format!(
+                    "{}={}; Domain=.{}; Path={}; Secure",
+                    c.name, c.value, d, path
+                ),
                 &url,
             );
             n += 1;
@@ -182,7 +195,11 @@ impl Icloud {
         let resp = self
             .http()
             .post("https://setup.icloud.com/setup/ws/1/validate")
-            .query(&[("clientBuildNumber", BUILD), ("clientMasteringNumber", BUILD), ("clientId", &client_id)])
+            .query(&[
+                ("clientBuildNumber", BUILD),
+                ("clientMasteringNumber", BUILD),
+                ("clientId", &client_id),
+            ])
             .header(header::CONTENT_TYPE, "text/plain")
             .body("null")
             .timeout(Duration::from_secs(30))
@@ -190,14 +207,17 @@ impl Icloud {
             .await?;
         let v: Value = check(resp).await?.json().await?;
         let ds = &v["dsInfo"];
-        let dsid = str_of(&ds["dsid"]).ok_or_else(|| ApiError::Shape("validate: no dsid".into()))?;
+        let dsid =
+            str_of(&ds["dsid"]).ok_or_else(|| ApiError::Shape("validate: no dsid".into()))?;
         let ws = &v["webservices"];
         let drivews = str_of(&ws["drivews"]["url"]).map(|u| host_url(&u));
         let docws = str_of(&ws["docws"]["url"])
             .map(|u| host_url(&u))
             .or_else(|| drivews.as_ref().map(|d| d.replace("-drivews.", "-docws.")));
         let (Some(drivews), Some(docws)) = (drivews, docws) else {
-            return Err(ApiError::Shape("validate: iCloud Drive is not enabled for this account".into()));
+            return Err(ApiError::Shape(
+                "validate: iCloud Drive is not enabled for this account".into(),
+            ));
         };
         let name = str_of(&ds["fullName"])
             .or_else(|| {
@@ -207,15 +227,29 @@ impl Icloud {
                 (!n.is_empty()).then_some(n)
             })
             .unwrap_or_else(|| "iCloud account".into());
-        let apple_id = str_of(&ds["appleId"]).or_else(|| str_of(&ds["primaryEmail"])).unwrap_or_default();
-        let account = Account { dsid, name, apple_id };
-        *self.session.write() = Some(Session { account: account.clone(), docws, drivews, client_id });
+        let apple_id = str_of(&ds["appleId"])
+            .or_else(|| str_of(&ds["primaryEmail"]))
+            .unwrap_or_default();
+        let account = Account {
+            dsid,
+            name,
+            apple_id,
+        };
+        *self.session.write() = Some(Session {
+            account: account.clone(),
+            docws,
+            drivews,
+            client_id,
+        });
         Ok(account)
     }
 
     /// One page of the Data Recovery list. Returns the page's records and the marker for
     /// the next page (None when this was the last page).
-    pub async fn tombstone_page(&self, marker: Option<&str>) -> ApiResult<(Vec<Value>, Option<String>)> {
+    pub async fn tombstone_page(
+        &self,
+        marker: Option<&str>,
+    ) -> ApiResult<(Vec<Value>, Option<String>)> {
         let s = self.session()?;
         let mut q: Vec<(&str, String)> = Self::params(&s).to_vec();
         q.push(("limit", PAGE.to_string()));
@@ -252,14 +286,16 @@ impl Icloud {
             Some(Value::Array(d)) => d,
             _ => Vec::new(),
         };
-        let next = str_of(&v["continuationMarker"]).filter(|_| v["status"].as_str() == Some("MORE_AVAILABLE"));
+        let next = str_of(&v["continuationMarker"])
+            .filter(|_| v["status"].as_str() == Some("MORE_AVAILABLE"));
         Ok((docs, next))
     }
 
     /// Put deleted items back where they were. Returns `(item_id, error)` for failures.
     pub async fn recover(&self, ids: &[String]) -> ApiResult<Vec<(String, String)>> {
         let s = self.session()?;
-        let body = json!({ "drive_item_update_request": { "is_recover": "true" }, "item_ids": ids });
+        let body =
+            json!({ "drive_item_update_request": { "is_recover": "true" }, "item_ids": ids });
         let resp = self
             .http()
             .put(format!("{}/v1/items", s.docws))
@@ -272,7 +308,9 @@ impl Icloud {
         let v: Value = check(resp).await?.json().await?;
         let mut failed = Vec::new();
         if let Some(list) = v["drive_items_with_status"].as_array() {
-            let per_item = list.iter().any(|e| e.get("item_id").is_some() || e.get("drive_item").is_some());
+            let per_item = list
+                .iter()
+                .any(|e| e.get("item_id").is_some() || e.get("drive_item").is_some());
             for (i, e) in list.iter().enumerate() {
                 let code = str_of(&e["status_code"]).unwrap_or_else(|| "200".into());
                 if code == "200" {
@@ -310,7 +348,10 @@ impl Icloud {
             .send()
             .await?;
         let v: Value = check(resp).await?.json().await?;
-        Ok(match v { Value::Array(a) => a, _ => Vec::new() })
+        Ok(match v {
+            Value::Array(a) => a,
+            _ => Vec::new(),
+        })
     }
 
     pub async fn create_folder(&self, parent: &str, name: &str) -> ApiResult<String> {
@@ -332,13 +373,19 @@ impl Icloud {
         let f = &v["folders"][0];
         match (str_of(&f["drivewsid"]), f["status"].as_str()) {
             (Some(id), Some("OK") | None) => Ok(id),
-            _ => Err(ApiError::Shape(format!("could not create folder \"{name}\""))),
+            _ => Err(ApiError::Shape(format!(
+                "could not create folder \"{name}\""
+            ))),
         }
     }
 
     /// Move items into a folder. Handles etag conflicts by retrying with Apple's etag.
     /// Returns `(drivewsid, error)` for failures.
-    pub async fn move_items(&self, dest: &str, items: &[(String, String)]) -> ApiResult<Vec<(String, String)>> {
+    pub async fn move_items(
+        &self,
+        dest: &str,
+        items: &[(String, String)],
+    ) -> ApiResult<Vec<(String, String)>> {
         let s = self.session()?;
         let mut pending: Vec<(String, String)> = items.to_vec();
         let mut failed = Vec::new();
@@ -360,10 +407,15 @@ impl Icloud {
                 .send()
                 .await?;
             let mut v: Value = check(resp).await?.json().await?;
-            let results = match v.get_mut("items").map(Value::take) { Some(Value::Array(a)) => a, _ => Vec::new() };
+            let results = match v.get_mut("items").map(Value::take) {
+                Some(Value::Array(a)) => a,
+                _ => Vec::new(),
+            };
             let mut retry = Vec::new();
             for (i, r) in results.iter().enumerate() {
-                let id = str_of(&r["drivewsid"]).or_else(|| pending.get(i).map(|p| p.0.clone())).unwrap_or_default();
+                let id = str_of(&r["drivewsid"])
+                    .or_else(|| pending.get(i).map(|p| p.0.clone()))
+                    .unwrap_or_default();
                 match r["status"].as_str() {
                     Some("OK") | None => {}
                     Some("ETAG_CONFLICT") if attempt < 2 => {
@@ -374,7 +426,11 @@ impl Icloud {
             }
             pending = retry;
         }
-        failed.extend(pending.into_iter().map(|(id, _)| (id, "move failed: etag conflict".into())));
+        failed.extend(
+            pending
+                .into_iter()
+                .map(|(id, _)| (id, "move failed: etag conflict".into())),
+        );
         Ok(failed)
     }
 
@@ -401,7 +457,11 @@ impl Icloud {
         for _ in 0..5 {
             let resp = self.http().get(&url).send().await?;
             if resp.status().as_u16() == 330 {
-                if let Some(loc) = resp.headers().get(header::LOCATION).and_then(|l| l.to_str().ok()) {
+                if let Some(loc) = resp
+                    .headers()
+                    .get(header::LOCATION)
+                    .and_then(|l| l.to_str().ok())
+                {
                     url = loc.to_string();
                     continue;
                 }
@@ -411,4 +471,3 @@ impl Icloud {
         Err(ApiError::Shape("too many redirects".into()))
     }
 }
-
