@@ -40,7 +40,8 @@ pub struct Item {
     pub t: String,
     /// true when this file is an exact copy of another file in the list (same name and content)
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
-    pub u: bool,    /// for a hidden copy: item_id of the file that is shown instead
+    pub u: bool,
+    /// for a hidden copy: item_id of the file that is shown instead
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub o: String,
 }
@@ -95,7 +96,13 @@ fn time_ms(v: &Value, keys: &[&str]) -> i64 {
             if n <= 0.0 {
                 continue;
             }
-            return if n < 1e11 { (n * 1000.0) as i64 } else if n > 1e14 { (n / 1000.0) as i64 } else { n as i64 };
+            return if n < 1e11 {
+                (n * 1000.0) as i64
+            } else if n > 1e14 {
+                (n / 1000.0) as i64
+            } else {
+                n as i64
+            };
         }
         if let Value::String(s) = x {
             if let Some(ms) = parse_iso(s) {
@@ -113,7 +120,14 @@ fn parse_iso(s: &str) -> Option<i64> {
         return None;
     }
     let p = |r: std::ops::Range<usize>| s.get(r)?.parse::<i64>().ok();
-    let (y, mo, d, h, mi, se) = (p(0..4)?, p(5..7)?, p(8..10)?, p(11..13)?, p(14..16)?, p(17..19)?);
+    let (y, mo, d, h, mi, se) = (
+        p(0..4)?,
+        p(5..7)?,
+        p(8..10)?,
+        p(11..13)?,
+        p(14..16)?,
+        p(17..19)?,
+    );
     // days from civil (Howard Hinnant)
     let y2 = if mo <= 2 { y - 1 } else { y };
     let era = y2.div_euclid(400);
@@ -141,7 +155,10 @@ fn parse_iso(s: &str) -> Option<i64> {
 
 /// Original folder path of a tombstone, as path components (file name excluded).
 fn restore_path(v: &Value, file_name: &str) -> Option<Vec<String>> {
-    let raw = v.get("restorePath").or_else(|| v.get("restore_path")).or_else(|| v.get("path"))?;
+    let raw = v
+        .get("restorePath")
+        .or_else(|| v.get("restore_path"))
+        .or_else(|| v.get("path"))?;
     let mut parts: Vec<String> = match raw {
         Value::String(s) => s.split('/').map(str::to_string).collect(),
         Value::Array(a) => a
@@ -159,7 +176,11 @@ fn restore_path(v: &Value, file_name: &str) -> Option<Vec<String>> {
     if parts.last().map(|l| l == file_name).unwrap_or(false) {
         parts.pop();
     }
-    if parts.first().map(|f| f == "root" || f == "iCloud Drive").unwrap_or(false) {
+    if parts
+        .first()
+        .map(|f| f == "root" || f == "iCloud Drive")
+        .unwrap_or(false)
+    {
         parts.remove(0);
     }
     Some(parts)
@@ -182,7 +203,10 @@ pub const GROUPS: &str = "Deleted folders";
 /// Stable name for a deleted folder: "Deleted folder 96A430B9".
 fn group_name(id: &str) -> String {
     let tail = id.rsplit("::").next().unwrap_or(id);
-    format!("Deleted folder {}", tail.chars().take(8).collect::<String>())
+    format!(
+        "Deleted folder {}",
+        tail.chars().take(8).collect::<String>()
+    )
 }
 
 /// Totals for one folder, its subfolders included.
@@ -195,6 +219,46 @@ pub struct FolderStat {
     /// a few file names, only for groups of a deleted folder
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub hint: Vec<String>,
+}
+
+/// Per-folder totals of a saved scan, as the overview shows them.
+/// Files Apple marks as unusable (`u`) are left out, as in the window list.
+pub fn overview(snap: &Snapshot) -> Vec<FolderStat> {
+    let n = snap.folders.len();
+    let mut files = vec![0u64; n];
+    let mut bytes = vec![0u64; n];
+    let groups = snap
+        .folders
+        .iter()
+        .position(|f| f.parent == 0 && f.name == GROUPS)
+        .map(|g| g as i32);
+    let mut hint: Vec<Vec<String>> = vec![Vec::new(); n];
+    for it in snap.items.iter().filter(|it| !it.u) {
+        let first = it.f as usize;
+        if first >= n {
+            continue;
+        }
+        if groups.is_some_and(|g| snap.folders[first].parent == g) && hint[first].len() < 3 {
+            hint[first].push(it.n.clone());
+        }
+        let mut f = it.f as i32;
+        while f >= 0 && (f as usize) < n {
+            files[f as usize] += 1;
+            bytes[f as usize] += it.s;
+            f = snap.folders[f as usize].parent;
+        }
+    }
+    snap.folders
+        .iter()
+        .enumerate()
+        .map(|(i, f)| FolderStat {
+            name: f.name.clone(),
+            parent: f.parent,
+            files: files[i],
+            bytes: bytes[i],
+            hint: std::mem::take(&mut hint[i]),
+        })
+        .collect()
 }
 
 pub struct Builder {
@@ -245,7 +309,11 @@ impl Builder {
     fn reset_folders(&mut self) {
         self.folders.clear();
         self.index.clear();
-        self.folders.push(Folder { name: "iCloud Drive".into(), parent: -1, path: String::new() });
+        self.folders.push(Folder {
+            name: "iCloud Drive".into(),
+            parent: -1,
+            path: String::new(),
+        });
         self.index.insert(String::new(), 0);
     }
 
@@ -377,7 +445,11 @@ impl Builder {
                 Some(&i) => i,
                 None => {
                     let i = self.folders.len() as u32;
-                    self.folders.push(Folder { name: p.clone(), parent: idx as i32, path: path.clone() });
+                    self.folders.push(Folder {
+                        name: p.clone(),
+                        parent: idx as i32,
+                        path: path.clone(),
+                    });
                     self.index.insert(path.clone(), i);
                     i
                 }
@@ -399,17 +471,31 @@ impl Builder {
                 let di = st(doc, &["docwsid", "document_id"]);
                 let z = st(doc, &["zone"]);
                 if !di.is_empty() {
-                    ws = format!("FOLDER::{}::{di}", if z.is_empty() { "com.apple.CloudDocs" } else { &z });
+                    ws = format!(
+                        "FOLDER::{}::{di}",
+                        if z.is_empty() {
+                            "com.apple.CloudDocs"
+                        } else {
+                            &z
+                        }
+                    );
                 }
             }
             if !ws.is_empty() {
-                self.dead_folders.insert(ws, (st(doc, &["name"]), st(doc, &["parentId", "parent_id"])));
+                self.dead_folders.insert(
+                    ws,
+                    (st(doc, &["name"]), st(doc, &["parentId", "parent_id"])),
+                );
             }
             return;
         }
         let mut name = st(doc, &["name", "filename", "basename"]);
         let mut ext = st(doc, &["extension"]);
-        if !ext.is_empty() && !name.to_lowercase().ends_with(&format!(".{}", ext.to_lowercase())) {
+        if !ext.is_empty()
+            && !name
+                .to_lowercase()
+                .ends_with(&format!(".{}", ext.to_lowercase()))
+        {
             name = format!("{name}.{ext}");
         } else if ext.is_empty() {
             if let Some((_, e)) = name.rsplit_once('.') {
@@ -431,10 +517,28 @@ impl Builder {
             z: zone.clone(),
             e: ext.to_lowercase(),
             s: size,
-            d: time_ms(doc, &["date_deleted", "dateDeleted", "deleted_at", "deletedAt", "deleted_time", "date_trashed", "trashed_at", "tombstone_date", "dtime", "deleted", "dateChanged"]),
+            d: time_ms(
+                doc,
+                &[
+                    "date_deleted",
+                    "dateDeleted",
+                    "deleted_at",
+                    "deletedAt",
+                    "deleted_time",
+                    "date_trashed",
+                    "trashed_at",
+                    "tombstone_date",
+                    "dtime",
+                    "deleted",
+                    "dateChanged",
+                ],
+            ),
             m: time_ms(doc, &["mtime", "date_modified", "dateModified", "modified"]),
             c: time_ms(doc, &["btime", "date_created", "dateCreated", "created"]),
-            x: doc.pointer("/file_flags/is_executable").and_then(Value::as_bool).unwrap_or(false),
+            x: doc
+                .pointer("/file_flags/is_executable")
+                .and_then(Value::as_bool)
+                .unwrap_or(false),
             t: st(doc, &["etag"]),
             u: false,
             o: String::new(),
@@ -448,7 +552,14 @@ impl Builder {
 
     pub fn finish(self, dsid: String, now: i64) -> Snapshot {
         let partial = !self.unplaced.is_empty();
-        Snapshot { scanned_at: now, dsid, items: self.items, folders: self.folders, partial_paths: partial, copies_checked: false }
+        Snapshot {
+            scanned_at: now,
+            dsid,
+            items: self.items,
+            folders: self.folders,
+            partial_paths: partial,
+            copies_checked: false,
+        }
     }
 }
 
@@ -457,12 +568,73 @@ mod tests {
     use super::*;
     use serde_json::json;
 
+    fn item(n: &str, f: u32, s: u64, u: bool) -> Item {
+        Item {
+            i: n.into(),
+            di: String::new(),
+            z: String::new(),
+            p: String::new(),
+            n: n.into(),
+            e: String::new(),
+            s,
+            d: 0,
+            m: 0,
+            c: 0,
+            f,
+            x: false,
+            t: String::new(),
+            u,
+            o: String::new(),
+        }
+    }
+
+    #[test]
+    fn overview_counts_subtrees_and_hints() {
+        let folder = |name: &str, parent: i32, path: &str| Folder {
+            name: name.into(),
+            parent,
+            path: path.into(),
+        };
+        let snap = Snapshot {
+            folders: vec![
+                folder("", -1, ""),
+                folder("Docs", 0, "Docs"),
+                folder(GROUPS, 0, GROUPS),
+                folder("Deleted folder AB", 2, "Deleted folders/Deleted folder AB"),
+            ],
+            items: vec![
+                item("a", 1, 10, false),
+                item("b", 1, 5, true),
+                item("c", 3, 7, false),
+                item("d", 3, 1, false),
+                item("e", 3, 1, false),
+                item("f", 3, 1, false),
+            ],
+            ..Default::default()
+        };
+        let o = overview(&snap);
+        assert_eq!((o[0].files, o[0].bytes), (5, 20));
+        assert_eq!((o[1].files, o[1].bytes), (1, 10));
+        assert_eq!(o[2].files, 4);
+        assert_eq!(o[3].hint, vec!["c", "d", "e"]);
+        assert!(o[1].hint.is_empty());
+    }
+
     #[test]
     fn iso_and_epoch_times() {
         assert_eq!(parse_iso("1970-01-01T00:00:01Z"), Some(1000));
-        assert_eq!(parse_iso("2026-11-02T10:00:00.250+02:00"), Some(1793606400250));
-        assert_eq!(time_ms(&json!({"mtime": 1_700_000_000}), &["mtime"]), 1_700_000_000_000);
-        assert_eq!(time_ms(&json!({"mtime": 1_700_000_000_000i64}), &["mtime"]), 1_700_000_000_000);
+        assert_eq!(
+            parse_iso("2026-11-02T10:00:00.250+02:00"),
+            Some(1793606400250)
+        );
+        assert_eq!(
+            time_ms(&json!({"mtime": 1_700_000_000}), &["mtime"]),
+            1_700_000_000_000
+        );
+        assert_eq!(
+            time_ms(&json!({"mtime": 1_700_000_000_000i64}), &["mtime"]),
+            1_700_000_000_000
+        );
     }
 
     #[test]
@@ -488,13 +660,25 @@ mod tests {
         let mut b = Builder::new();
         b.push(&json!({"item_id":"f1","name":"a","extension":"txt","parentId":"FOLDER::com.apple.CloudDocs::D1","size":3}));
         b.relayout(&HashMap::new());
-        assert_eq!(b.wanted(&HashSet::new()), vec!["FOLDER::com.apple.CloudDocs::D1".to_string()]);
-        assert_eq!(b.folders[b.items[0].f as usize].path, "Deleted folders/Deleted folder D1");
-        assert_eq!(b.stats()[b.items[0].f as usize].hint, vec!["a.txt".to_string()]);
+        assert_eq!(
+            b.wanted(&HashSet::new()),
+            vec!["FOLDER::com.apple.CloudDocs::D1".to_string()]
+        );
+        assert_eq!(
+            b.folders[b.items[0].f as usize].path,
+            "Deleted folders/Deleted folder D1"
+        );
+        assert_eq!(
+            b.stats()[b.items[0].f as usize].hint,
+            vec!["a.txt".to_string()]
+        );
         // the deleted folder shows up in a later page
         b.push(&json!({"item_id":"d1","type":"FOLDER","name":"Old","drivewsid":"FOLDER::com.apple.CloudDocs::D1","parentId":"FOLDER::com.apple.CloudDocs::L"}));
         let mut r = HashMap::new();
-        r.insert("FOLDER::com.apple.CloudDocs::L".to_string(), vec!["Docs".to_string()]);
+        r.insert(
+            "FOLDER::com.apple.CloudDocs::L".to_string(),
+            vec!["Docs".to_string()],
+        );
         b.relayout(&r);
         let st = b.stats();
         assert_eq!(st[0].files, 1);

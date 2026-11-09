@@ -13,8 +13,9 @@ use serde::Serialize;
 use serde_json::Value;
 use std::{
     collections::{HashMap, HashSet},
-    sync::{atomic::AtomicBool, Arc},
-    time::{SystemTime, UNIX_EPOCH},
+    path::{Path, PathBuf},
+    sync::{atomic::AtomicBool, Arc, OnceLock},
+    time::{Instant, SystemTime, UNIX_EPOCH},
 };
 use tauri::{ipc::Response, AppHandle, Emitter, Manager, State};
 use tauri_plugin_dialog::DialogExt;
@@ -30,20 +31,115 @@ pub struct AppState {
     pub snapshot: RwLock<Option<Arc<Snapshot>>>,
     pub restored: Mutex<HashSet<String>>,
     pub job: Mutex<Option<Arc<AtomicBool>>>,
+    /// The saved scan, read from disk on a thread while the window opens.
+    warm: Mutex<Option<std::thread::JoinHandle<Warm>>>,
+    /// The window JSON of the saved scan, made on that thread. Used once.
+    first_view: Mutex<Option<String>>,
+    /// The overview JSON of the saved scan, made on that thread. Used once.
+    first_overview: Mutex<Option<String>>,
+    /// Folders a restore to this Mac wrote to. "Show in Finder" opens only these.
+    outputs: Mutex<HashSet<PathBuf>>,
+}
+
+/// What the launch thread reads from disk.
+struct Warm {
+    snapshot: Option<Snapshot>,
+    restored: HashSet<String>,
+    view: Option<String>,
+    overview: Option<String>,
+}
+
+impl Warm {
+    fn load(store: &Store) -> Self {
+        let restored = store.restored();
+        let snapshot = store.last_snapshot();
+        let overview = snapshot.as_ref().map(overview_json);
+        let view = snapshot.as_ref().map(|s| view_json(s, &restored));
+        Self {
+            snapshot,
+            restored,
+            view,
+            overview,
+        }
+    }
+}
+
+impl AppState {
+    /// Wait for the launch thread (once) and take what it read.
+    /// The lock stays held while it waits, so no caller sees the state half filled.
+    fn warm(&self) {
+        let mut slot = self.warm.lock();
+        let Some(handle) = slot.take() else { return };
+        let Ok(w) = handle.join() else { return };
+        self.restored.lock().extend(w.restored);
+        let mut snap = self.snapshot.write();
+        if snap.is_none() {
+            *snap = w.snapshot.map(Arc::new);
+            *self.first_view.lock() = w.view;
+            *self.first_overview.lock() = w.overview;
+        }
+    }
+
+    fn set_snapshot(&self, s: Option<Snapshot>) {
+        *self.first_view.lock() = None;
+        *self.first_overview.lock() = None;
+        *self.snapshot.write() = s.map(Arc::new);
+    }
+
+    /// Keep the saved scan only if it belongs to this Apple Account.
+    fn keep_snapshot_of(&self, dsid: &str) {
+        let other = self
+            .snapshot
+            .read()
+            .as_ref()
+            .map(|s| s.dsid != dsid)
+            .unwrap_or(false);
+        if other {
+            self.set_snapshot(None);
+        }
+        if self.snapshot.read().is_none() {
+            if let Some(s) = self.store.snapshot(dsid) {
+                self.set_snapshot(Some(s));
+            }
+        }
+    }
 }
 
 type CmdResult<T> = Result<T, ApiError>;
 type Page = Result<(Vec<Value>, Option<String>), ApiError>;
 
+/// When the process started, for the startup timing in the log.
+static START: OnceLock<Instant> = OnceLock::new();
+
+fn since_start_ms() -> f64 {
+    START
+        .get()
+        .map(|t| t.elapsed().as_secs_f64() * 1000.0)
+        .unwrap_or(0.0)
+}
+
+/// Log one startup step with the time since the process started.
+fn log_step(stage: &str) {
+    tracing::info!(target: "startup", stage, ms = since_start_ms(), "startup step");
+}
+
+/// The window reports its startup steps here.
+#[tauri::command]
+fn mark(stage: String) {
+    log_step(&stage);
+}
+
 fn now_ms() -> i64 {
-    SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_millis() as i64).unwrap_or(0)
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0)
 }
 
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 struct AppInfo {
     account: Option<Account>,
-    has_snapshot: bool,
     version: String,
 }
 
@@ -51,7 +147,6 @@ struct AppInfo {
 fn app_state(app: AppHandle, state: State<AppState>) -> AppInfo {
     AppInfo {
         account: state.icloud.account(),
-        has_snapshot: state.snapshot.read().is_some(),
         version: app.package_info().version.to_string(),
     }
 }
@@ -68,17 +163,17 @@ async fn resume_session(app: AppHandle) -> Option<Account> {
     }
     let state = app.state::<AppState>();
     let account = state.icloud.account()?;
-    if let Some(s) = state.store.snapshot(&account.dsid) {
-        *state.snapshot.write() = Some(Arc::new(s));
-    }
+    state.warm();
+    state.keep_snapshot_of(&account.dsid);
     Some(account)
 }
 
 #[tauri::command]
 fn sign_out(app: AppHandle, state: State<AppState>) {
+    state.warm();
     state.icloud.sign_out();
     state.store.clear();
-    *state.snapshot.write() = None;
+    state.set_snapshot(None);
     state.restored.lock().clear();
     if let Some(w) = app.get_webview_window("main") {
         let _ = w.clear_all_browsing_data();
@@ -105,6 +200,7 @@ struct UiItem<'a> {
 #[serde(rename_all = "camelCase")]
 struct UiSnapshot<'a> {
     scanned_at: i64,
+    dsid: &'a str,
     items: Vec<UiItem<'a>>,
     folders: &'a [model::Folder],
     partial_paths: bool,
@@ -118,42 +214,111 @@ struct View<'a> {
 }
 
 fn view(state: &AppState) -> Response {
-    let Some(snap) = state.snapshot.read().clone() else { return Response::new("null".to_string()) };
+    let Some(snap) = state.snapshot.read().clone() else {
+        return Response::new("null".to_string());
+    };
+    let restored = state.restored.lock();
+    Response::new(view_json(&snap, &restored))
+}
+
+fn view_json(snap: &Snapshot, restored: &HashSet<String>) -> String {
     let items = snap
         .items
         .iter()
         .filter(|it| !it.u)
-        .map(|it| UiItem { i: &it.i, n: &it.n, e: &it.e, s: it.s, d: it.d, m: it.m, c: it.c, f: it.f, x: it.x })
+        .map(|it| UiItem {
+            i: &it.i,
+            n: &it.n,
+            e: &it.e,
+            s: it.s,
+            d: it.d,
+            m: it.m,
+            c: it.c,
+            f: it.f,
+            x: it.x,
+        })
         .collect();
     let snapshot = UiSnapshot {
         scanned_at: snap.scanned_at,
+        dsid: &snap.dsid,
         items,
         folders: &snap.folders,
         partial_paths: snap.partial_paths,
         copies_checked: snap.copies_checked,
     };
-    let restored = state.restored.lock();
-    Response::new(serde_json::to_string(&View { snapshot, restored: &restored }).unwrap_or_else(|_| "null".into()))
+    serde_json::to_string(&View { snapshot, restored }).unwrap_or_else(|_| "null".into())
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct SavedOverview<'a> {
+    dsid: &'a str,
+    scanned_at: i64,
+    files: u64,
+    bytes: u64,
+    folders: Vec<model::FolderStat>,
+}
+
+/// Small JSON for the first screen: totals per folder, no file list.
+fn overview_json(snap: &Snapshot) -> String {
+    let folders = model::overview(snap);
+    let files = snap.items.iter().filter(|it| !it.u).count() as u64;
+    let bytes = folders.first().map(|f| f.bytes).unwrap_or(0);
+    let o = SavedOverview {
+        dsid: &snap.dsid,
+        scanned_at: snap.scanned_at,
+        files,
+        bytes,
+        folders,
+    };
+    serde_json::to_string(&o).unwrap_or_else(|_| "null".into())
+}
+
+/// The overview of the saved scan. The window paints this first, then loads the full list.
+#[tauri::command]
+fn get_overview(state: State<AppState>) -> Response {
+    state.warm();
+    if let Some(acc) = state.icloud.account() {
+        state.keep_snapshot_of(&acc.dsid);
+    }
+    if let Some(o) = state.first_overview.lock().take() {
+        return Response::new(o);
+    }
+    match state.snapshot.read().clone() {
+        Some(snap) => Response::new(overview_json(&snap)),
+        None => Response::new("null".to_string()),
+    }
 }
 
 #[tauri::command]
 fn get_snapshot(state: State<AppState>) -> Response {
-    // After a new sign-in the saved scan is not in memory yet: load it from disk.
-    if state.snapshot.read().is_none() {
-        if let Some(acc) = state.icloud.account() {
-            if let Some(s) = state.store.snapshot(&acc.dsid) {
-                *state.snapshot.write() = Some(Arc::new(s));
-            }
-        }
+    state.warm();
+    // Before the sign-in check ends, the window shows the last saved scan.
+    // After it, only a scan of the signed-in Apple Account is shown.
+    if let Some(acc) = state.icloud.account() {
+        state.keep_snapshot_of(&acc.dsid);
+    }
+    if let Some(v) = state.first_view.lock().take() {
+        return Response::new(v);
     }
     view(&state)
 }
 
 /// Turn Apple's folder hierarchy reply into path parts below iCloud Drive.
 fn hierarchy_parts(entry: &Value) -> Option<Vec<String>> {
-    let is_root = |v: &Value| v["drivewsid"].as_str().map(|d| d.ends_with("::root")).unwrap_or(false);
-    let mut chain: Vec<&Value> = entry["hierarchy"].as_array().map(|a| a.iter().collect()).unwrap_or_default();
-    if chain.last().map(|l| is_root(l)).unwrap_or(false) && !chain.first().map(|f| is_root(f)).unwrap_or(false) {
+    let is_root = |v: &Value| {
+        v["drivewsid"]
+            .as_str()
+            .map(|d| d.ends_with("::root"))
+            .unwrap_or(false)
+    };
+    let mut chain: Vec<&Value> = entry["hierarchy"]
+        .as_array()
+        .map(|a| a.iter().collect())
+        .unwrap_or_default();
+    if chain.last().map(|l| is_root(l)).unwrap_or(false)
+        && !chain.first().map(|f| is_root(f)).unwrap_or(false)
+    {
         chain.reverse();
     }
     chain.push(entry);
@@ -164,7 +329,9 @@ fn hierarchy_parts(entry: &Value) -> Option<Vec<String>> {
         }
         let name = node["name"].as_str()?;
         let full = match node["extension"].as_str() {
-            Some(e) if !e.is_empty() && node["type"].as_str() != Some("FOLDER") => format!("{name}.{e}"),
+            Some(e) if !e.is_empty() && node["type"].as_str() != Some("FOLDER") => {
+                format!("{name}.{e}")
+            }
             _ => name.to_string(),
         };
         if parts.last() != Some(&full) {
@@ -207,8 +374,14 @@ async fn resolve_paths(
         match res {
             Ok(entries) => {
                 for e in entries {
-                    let Some(id) = e["drivewsid"].as_str() else { continue };
-                    let parts = if id.ends_with("::root") { Some(Vec::new()) } else { hierarchy_parts(&e) };
+                    let Some(id) = e["drivewsid"].as_str() else {
+                        continue;
+                    };
+                    let parts = if id.ends_with("::root") {
+                        Some(Vec::new())
+                    } else {
+                        hierarchy_parts(&e)
+                    };
                     if let Some(parts) = parts {
                         resolved.insert(id.to_string(), parts);
                     }
@@ -241,7 +414,14 @@ fn emit_overview(app: &AppHandle, b: &Builder, pages: usize, complete: bool) {
     let bytes = folders.first().map(|f| f.bytes).unwrap_or(0);
     let _ = app.emit(
         "scan://folders",
-        Overview { files: b.items.len(), bytes, pages, complete, unknown: b.unplaced.len(), folders: &folders },
+        Overview {
+            files: b.items.len(),
+            bytes,
+            pages,
+            complete,
+            unknown: b.unplaced.len(),
+            folders: &folders,
+        },
     );
 }
 
@@ -249,11 +429,18 @@ fn emit_overview(app: &AppHandle, b: &Builder, pages: usize, complete: bool) {
 async fn scan(app: AppHandle, fresh: Option<bool>) -> CmdResult<Response> {
     let state = app.state::<AppState>();
     let account = state.icloud.account().ok_or(ApiError::NotSignedIn)?;
+    state.warm();
     let icloud: &Icloud = &state.icloud;
     // A finished scan is kept. Only an explicit "Scan again" (fresh) reads Apple's list again.
-    if !fresh.unwrap_or(false) && state.store.scan_state().map(|s| s.complete && s.dsid == account.dsid).unwrap_or(false) {
+    if !fresh.unwrap_or(false)
+        && state
+            .store
+            .scan_state()
+            .map(|s| s.complete && s.dsid == account.dsid)
+            .unwrap_or(false)
+    {
         if let Some(snap) = state.store.snapshot(&account.dsid) {
-            *state.snapshot.write() = Some(Arc::new(snap));
+            state.set_snapshot(Some(snap));
             return Ok(view(&state));
         }
     }
@@ -264,13 +451,20 @@ async fn scan(app: AppHandle, fresh: Option<bool>) -> CmdResult<Response> {
     let (mut resolved, mut tried) = state.store.paths(&account.dsid).unwrap_or_default();
     let dsid = account.dsid.clone();
     let store = &state.store;
-    let save = |r: &HashMap<String, Vec<String>>, t: &HashSet<String>| store.save_paths(&dsid, r, t);
+    let save =
+        |r: &HashMap<String, Vec<String>>, t: &HashSet<String>| store.save_paths(&dsid, r, t);
 
     // Continue a scan that stopped (app closed, crash) instead of starting again.
     let saved = state
         .store
         .scan_state()
-        .filter(|s| !fresh.unwrap_or(false) && s.dsid == account.dsid && !s.complete && s.pages > 0 && s.marker.is_some())
+        .filter(|s| {
+            !fresh.unwrap_or(false)
+                && s.dsid == account.dsid
+                && !s.complete
+                && s.pages > 0
+                && s.marker.is_some()
+        })
         .and_then(|s| state.store.scan_pages(s.pages).map(|p| (s, p)));
     let mut st = match saved {
         Some((s, pages)) => {
@@ -280,7 +474,10 @@ async fn scan(app: AppHandle, fresh: Option<bool>) -> CmdResult<Response> {
                 }
             }
             tracing::info!(target: "scan", pages = s.pages, items = b.items.len(), "resuming saved scan");
-            let _ = app.emit("scan://progress", serde_json::json!({ "count": b.items.len(), "phase": "list" }));
+            let _ = app.emit(
+                "scan://progress",
+                serde_json::json!({ "count": b.items.len(), "phase": "list" }),
+            );
             // Show what is known at once, then fill in folders not looked up yet.
             b.relayout(&resolved);
             emit_overview(&app, &b, s.pages, false);
@@ -293,7 +490,10 @@ async fn scan(app: AppHandle, fresh: Option<bool>) -> CmdResult<Response> {
         }
         None => {
             state.store.scan_reset(&account.dsid);
-            store::ScanState { dsid: account.dsid.clone(), ..Default::default() }
+            store::ScanState {
+                dsid: account.dsid.clone(),
+                ..Default::default()
+            }
         }
     };
     let mut unverified = st.pages > 0;
@@ -313,7 +513,10 @@ async fn scan(app: AppHandle, fresh: Option<bool>) -> CmdResult<Response> {
                 tracing::warn!(target: "scan", error = %e, "saved marker refused, starting over");
                 unverified = false;
                 state.store.scan_reset(&account.dsid);
-                st = store::ScanState { dsid: account.dsid.clone(), ..Default::default() };
+                st = store::ScanState {
+                    dsid: account.dsid.clone(),
+                    ..Default::default()
+                };
                 b = Builder::new();
                 continue;
             }
@@ -327,7 +530,10 @@ async fn scan(app: AppHandle, fresh: Option<bool>) -> CmdResult<Response> {
         st.complete = next.is_none();
         st.marker = next;
         state.store.scan_page(&st, &docs);
-        let _ = app.emit("scan://progress", serde_json::json!({ "count": b.items.len(), "phase": "list" }));
+        let _ = app.emit(
+            "scan://progress",
+            serde_json::json!({ "count": b.items.len(), "phase": "list" }),
+        );
         let looked_up = if st.complete {
             resolve_paths(&app, icloud, &b, &mut resolved, &mut tried).await
         } else {
@@ -357,18 +563,23 @@ async fn scan(app: AppHandle, fresh: Option<bool>) -> CmdResult<Response> {
     copies::mark(&mut snap);
     tracing::info!(target: "scan", items = snap.items.len(), folders = snap.folders.len(), partial = snap.partial_paths, "snapshot built");
     state.store.save_snapshot(&snap);
-    *state.snapshot.write() = Some(Arc::new(snap));
+    state.set_snapshot(Some(snap));
     Ok(view(&state))
 }
 
 /// Hide likely copies in the saved scan (no network).
 #[tauri::command]
 fn find_copies(state: State<AppState>) -> CmdResult<Response> {
-    let snap = state.snapshot.read().clone().ok_or_else(|| ApiError::Shape("scan first".into()))?;
+    state.warm();
+    let snap = state
+        .snapshot
+        .read()
+        .clone()
+        .ok_or_else(|| ApiError::Shape("scan first".into()))?;
     let mut snap = (*snap).clone();
     copies::mark(&mut snap);
     state.store.save_snapshot(&snap);
-    *state.snapshot.write() = Some(Arc::new(snap));
+    state.set_snapshot(Some(snap));
     Ok(view(&state))
 }
 
@@ -380,7 +591,10 @@ struct IcloudFolder {
 }
 
 #[tauri::command]
-async fn list_icloud_folder(state: State<'_, AppState>, id: Option<String>) -> CmdResult<Vec<IcloudFolder>> {
+async fn list_icloud_folder(
+    state: State<'_, AppState>,
+    id: Option<String>,
+) -> CmdResult<Vec<IcloudFolder>> {
     let id = id.unwrap_or_else(|| ROOT_ID.to_string());
     let entries = state.icloud.folders(&[id], false).await?;
     let mut out: Vec<IcloudFolder> = entries
@@ -393,7 +607,10 @@ async fn list_icloud_folder(state: State<'_, AppState>, id: Option<String>) -> C
                     Some(IcloudFolder {
                         id: x["drivewsid"].as_str()?.to_string(),
                         name: x["name"].as_str()?.to_string(),
-                        count: x["directChildrenCount"].as_u64().or_else(|| x["numberOfItems"].as_u64()).unwrap_or(0),
+                        count: x["directChildrenCount"]
+                            .as_u64()
+                            .or_else(|| x["numberOfItems"].as_u64())
+                            .unwrap_or(0),
                     })
                 })
                 .collect()
@@ -404,7 +621,11 @@ async fn list_icloud_folder(state: State<'_, AppState>, id: Option<String>) -> C
 }
 
 #[tauri::command]
-async fn create_icloud_folder(state: State<'_, AppState>, parent: String, name: String) -> CmdResult<String> {
+async fn create_icloud_folder(
+    state: State<'_, AppState>,
+    parent: String,
+    name: String,
+) -> CmdResult<String> {
     state.icloud.create_folder(&parent, &name).await
 }
 
@@ -424,23 +645,51 @@ async fn pick_local_folder(app: AppHandle) -> Option<String> {
 }
 
 #[tauri::command]
-fn start_restore(app: AppHandle, state: State<AppState>, ids: Vec<String>, destination: Destination) -> CmdResult<String> {
-    let snap = state.snapshot.read().clone().ok_or_else(|| ApiError::Shape("scan first".into()))?;
+fn start_restore(
+    app: AppHandle,
+    state: State<AppState>,
+    ids: Vec<String>,
+    destination: Destination,
+) -> CmdResult<String> {
+    state.warm();
+    let snap = state
+        .snapshot
+        .read()
+        .clone()
+        .ok_or_else(|| ApiError::Shape("scan first".into()))?;
     state.icloud.session()?;
     let mut job_slot = state.job.lock();
-    if job_slot.as_ref().map(|c| !c.load(std::sync::atomic::Ordering::Relaxed)).unwrap_or(false) {
+    if job_slot
+        .as_ref()
+        .map(|c| !c.load(std::sync::atomic::Ordering::Relaxed))
+        .unwrap_or(false)
+    {
         return Err(ApiError::Shape("a restore is already running".into()));
     }
     let wanted: HashSet<String> = ids.into_iter().collect();
     // Hidden copies always come back with the file that is shown for them.
-    let items: Vec<_> = snap.items.iter().filter(|i| wanted.contains(&i.i) || (!i.o.is_empty() && wanted.contains(&i.o))).cloned().collect();
+    let items: Vec<_> = snap
+        .items
+        .iter()
+        .filter(|i| wanted.contains(&i.i) || (!i.o.is_empty() && wanted.contains(&i.o)))
+        .cloned()
+        .collect();
     if items.is_empty() {
         return Err(ApiError::Shape("nothing selected".into()));
+    }
+    if let Destination::Local { path } = &destination {
+        state.outputs.lock().insert(PathBuf::from(path));
     }
     let cancel = Arc::new(AtomicBool::new(false));
     *job_slot = Some(cancel.clone());
     let id = uuid::Uuid::new_v4().to_string();
-    let job = Job { id: id.clone(), items, folders: snap.folders.clone(), dest: destination, cancel: cancel.clone() };
+    let job = Job {
+        id: id.clone(),
+        items,
+        folders: snap.folders.clone(),
+        dest: destination,
+        cancel: cancel.clone(),
+    };
     tracing::info!(target: "restore", job = %id, count = job.items.len(), "restore started");
     tauri::async_runtime::spawn(async move {
         restore::run(app, job).await;
@@ -457,14 +706,20 @@ fn cancel_restore(state: State<AppState>) {
     }
 }
 
+/// Open in Finder a folder that a restore wrote to. Any other path is refused, so the
+/// window cannot make the app open files or apps.
 #[tauri::command]
-fn reveal(path: String) {
-    let _ = std::process::Command::new("open").arg("-R").arg(path).spawn();
-}
-
-#[tauri::command]
-fn open_folder(path: String) {
-    let _ = std::process::Command::new("open").arg(path).spawn();
+fn open_folder(state: State<AppState>, path: String) -> Result<(), String> {
+    let p = Path::new(&path);
+    if !p.is_absolute() || !p.is_dir() || !state.outputs.lock().contains(p) {
+        tracing::warn!(target: "security", "open_folder refused a path that no restore wrote to");
+        return Err("Salvage opens only folders it restored files to.".into());
+    }
+    std::process::Command::new("/usr/bin/open")
+        .arg(p)
+        .spawn()
+        .map(|_| ())
+        .map_err(|e| e.to_string())
 }
 
 fn init_logs() {
@@ -473,32 +728,60 @@ fn init_logs() {
     if std::env::var("SALVAGE_LOG_PRETTY").is_ok() {
         fmt().with_env_filter(filter).init();
     } else {
-        fmt().json().with_current_span(false).with_env_filter(filter).init();
+        fmt()
+            .json()
+            .with_current_span(false)
+            .with_env_filter(filter)
+            .init();
     }
 }
 
 fn main() {
+    START.get_or_init(Instant::now);
     init_logs();
+    log_step("main");
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
         .setup(|app| {
-            let dir = app.path().app_data_dir()?;
-            let store = Store::new(dir);
-            let restored = store.restored();
+            log_step("setup-start");
+            // Read the saved scan on a thread while the window opens.
+            let store = Store::new(app.path().app_data_dir()?);
+            let disk = store.clone();
+            let warm = std::thread::spawn(move || {
+                let w = Warm::load(&disk);
+                log_step("warm");
+                w
+            });
             app.manage(AppState {
                 icloud: Icloud::new(),
                 store,
                 snapshot: RwLock::new(None),
-                restored: Mutex::new(restored),
+                restored: Mutex::new(HashSet::new()),
                 job: Mutex::new(None),
+                warm: Mutex::new(Some(warm)),
+                first_view: Mutex::new(None),
+                first_overview: Mutex::new(None),
+                outputs: Mutex::new(HashSet::new()),
             });
+            let cfg = app
+                .config()
+                .app
+                .windows
+                .iter()
+                .find(|w| w.label == "main")
+                .cloned()
+                .ok_or("no main window")?;
+            tauri::WebviewWindowBuilder::from_config(app.handle(), &cfg)?.build()?;
+            log_step("window");
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
+            mark,
             app_state,
             sign_in,
             sign_out,
             resume_session,
+            get_overview,
             get_snapshot,
             scan,
             find_copies,
@@ -507,9 +790,12 @@ fn main() {
             pick_local_folder,
             start_restore,
             cancel_restore,
-            reveal,
             open_folder
         ])
-        .run(tauri::generate_context!())
+        .build(tauri::generate_context!())
+        .map(|app| {
+            log_step("built");
+            app.run(|_, _| {})
+        })
         .expect("error while running Salvage");
 }
