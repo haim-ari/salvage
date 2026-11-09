@@ -1,6 +1,6 @@
 {
   "name": "salvage",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "private": true,
   "description": "Fast native restore client for iCloud Drive deleted files",
   "license": "MIT",
