@@ -33,12 +33,13 @@ function when(ms) {
   return d.getFullYear() === thisYear ? `${dFmt.format(d)}, ${tFmt.format(d)}` : dyFmt.format(d);
 }
 function expires(item) {
-  if (!item.d) return { text: "—", cls: "" };
+  if (!item.d) return { text: "—", cls: "", p: 0 };
   const left = item.d + KEEP_DAYS * DAY - Date.now();
-  if (left <= 0) return { text: "any time", cls: "exp-soon" };
+  if (left <= 0) return { text: "any time", cls: "exp-soon", p: 0 };
   const days = left / DAY;
   const text = days < 1 ? `${Math.max(1, Math.round(left / 3600000))} h` : `${Math.floor(days)} days`;
-  return { text, cls: days < 3 ? "exp-soon" : days < 7 ? "exp-mid" : "" };
+  // p: share of Apple's 30 days still left, drawn as a small clock
+  return { text, cls: days < 3 ? "exp-soon" : days < 8 ? "exp-mid" : "", p: Math.min(1, days / KEEP_DAYS).toFixed(3) };
 }
 function ago(ms) {
   const s = (Date.now() - ms) / 1000;
@@ -461,7 +462,7 @@ function rowHtml(r) {
     <div class="c-size">${bytes(it.s)}</div>
     <div class="c-mod">${when(it.m)}</div>
     <div class="c-del">${when(it.d)}</div>
-    <div class="c-exp ${done ? "" : ex.cls}">${done ? "" : ex.text}</div>
+    <div class="c-exp ${done ? "" : ex.cls}">${done ? "" : `<span class="clk" style="--p:${ex.p}"></span>${ex.text}`}</div>
   </div>`;
 }
 
@@ -645,8 +646,8 @@ function renderOvState() {
   $("ov-files").textContent = plural(O.files, "file");
   $("ov-bytes").textContent = gb(O.bytes);
   const st = $("ov-state");
-  if (O.complete && O.checking) st.innerHTML = `<span class="pill ok">✓ All files found</span><span class="pill wait"><span class="mini"></span>Removing copies</span><span>${esc(O.progress)}</span>`;
-  else if (O.complete) st.innerHTML = `<span class="pill ok">✓ All files found</span>`;
+  if (O.complete && O.checking) st.innerHTML = `<span class="pill ok">All files found</span><span class="pill wait"><span class="mini"></span>Removing copies</span><span>${esc(O.progress)}</span>`;
+  else if (O.complete) st.innerHTML = `<span class="pill ok">All files found</span>`;
   else if (O.scanning) st.innerHTML = `<span class="pill wait"><span class="mini"></span>Finding files</span><span>${esc(O.progress)}</span>`;
   else st.innerHTML = `<span class="pill wait">Not complete</span><span>The scan stopped. Use Scan again.</span>`;
   $("btn-browse").disabled = !O.complete || !!O.checking || !S.items.length;
@@ -677,7 +678,7 @@ function renderOverview() {
   // map path -> snapshot folder index, to open the browser at the right place
   if (O.complete && !O.loading && !O.map) { O.map = new Map(); S.folders.forEach((f, i) => O.map.set(f.path, i)); }
 
-  const status = O.complete ? `<span class="pill ok">✓ All found</span>` : `<span class="pill wait"><span class="mini"></span>Finding files</span>`;
+  const status = O.complete ? `<span class="pill ok">All found</span>` : `<span class="pill wait"><span class="mini"></span>Finding files</span>`;
   const folderSvg = `<svg class="fold" viewBox="0 0 16 16"><path d="M1.5 4.5a1 1 0 0 1 1-1h3.2l1.3 1.4h6.5a1 1 0 0 1 1 1v6.6a1 1 0 0 1-1 1h-11a1 1 0 0 1-1-1z" fill="currentColor" opacity=".9"/></svg>`;
   const out = [];
   const row = (i, depth, label) => {
@@ -688,18 +689,18 @@ function renderOverview() {
     const canOpen = O.complete;
     out.push(`<div class="ov-row" data-key="${esc(key)}" data-i="${i}">
       <div class="ov-name" style="padding-left:${depth * 18}px">
-        <button class="ov-caret ${has ? (on ? "on" : "") : "none"}" data-act="toggle" tabindex="-1">▸</button>${folderSvg}
+        <button class="ov-caret ${has ? (on ? "on" : "") : "none"}" data-act="toggle" tabindex="-1"><svg viewBox="0 0 10 10" width="9" height="9"><path d="M3.5 2 7 5 3.5 8" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg></button>${folderSvg}
         <span class="label ${canOpen ? "open" : ""}" data-act="open" title="${canOpen ? "Open this folder" : "You can open folders when all files are found"}">${esc(label || f.name)}</span>${f.hint && f.hint.length ? `<span class="hint">e.g. ${esc(f.hint.join(", "))}</span>` : ""}${f.name === GROUPS && i > 0 && O.folders[i].parent === 0 ? `<span class="hint">Apple does not keep the names of deleted folders</span>` : ""}
       </div>
       <div class="ov-num">${n(f.files)}</div>
-      <div class="ov-num">${gb(f.bytes)}</div>
+      <div class="ov-num ov-size"><span class="ov-bar"><i style="--w:${O.bytes ? (f.bytes / O.bytes).toFixed(4) : 0}"></i></span>${gb(f.bytes)}</div>
       <div class="ov-st">${status}</div>
     </div>`);
     if (on) {
       const limit = O.more.get(key) || 200;
       for (const c of kids[i].slice(0, limit)) row(c, depth + 1);
       const rest = kids[i].length - limit;
-      if (rest > 0) out.push(`<div class="ov-row" data-key="${esc(key)}"><div class="ov-name" style="padding-left:${(depth + 1) * 18}px"><button class="ov-caret none" tabindex="-1">▸</button><span class="label open" data-act="more">Show ${n(Math.min(rest, 200))} more (${n(rest)} not shown)</span></div><div class="ov-num"></div><div class="ov-num"></div><div class="ov-st"></div></div>`);
+      if (rest > 0) out.push(`<div class="ov-row" data-key="${esc(key)}"><div class="ov-name" style="padding-left:${(depth + 1) * 18}px"><button class="ov-caret none" tabindex="-1"><svg viewBox="0 0 10 10" width="9" height="9"><path d="M3.5 2 7 5 3.5 8" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg></button><span class="label open" data-act="more">Show ${n(Math.min(rest, 200))} more (${n(rest)} not shown)</span></div><div class="ov-num"></div><div class="ov-num"></div><div class="ov-st"></div></div>`);
     }
   };
   // files directly in iCloud Drive (not in any folder)
@@ -707,7 +708,7 @@ function renderOverview() {
     const direct = O.folders[0].files - kids[0].reduce((a, c) => a + O.folders[c].files, 0);
     if (direct > 0) {
       const bytesDirect = O.folders[0].bytes - kids[0].reduce((a, c) => a + O.folders[c].bytes, 0);
-      out.push(`<div class="ov-row" data-key="" data-i="0"><div class="ov-name"><button class="ov-caret none" tabindex="-1">▸</button>${folderSvg}<span class="label ${O.complete ? "open" : ""}" data-act="open">Top of iCloud Drive</span></div><div class="ov-num">${n(direct)}</div><div class="ov-num">${gb(bytesDirect)}</div><div class="ov-st">${status}</div></div>`);
+      out.push(`<div class="ov-row" data-key="" data-i="0"><div class="ov-name"><button class="ov-caret none" tabindex="-1"><svg viewBox="0 0 10 10" width="9" height="9"><path d="M3.5 2 7 5 3.5 8" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg></button>${folderSvg}<span class="label ${O.complete ? "open" : ""}" data-act="open">Top of iCloud Drive</span></div><div class="ov-num">${n(direct)}</div><div class="ov-num">${gb(bytesDirect)}</div><div class="ov-st">${status}</div></div>`);
     }
     for (const c of kids[0]) row(c, 0);
   }
@@ -811,7 +812,7 @@ function toast(text, ms = 2600) {
 function openMenu(anchor, items, { above = false } = {}) {
   const m = $("menu");
   m.innerHTML = items
-    .map((it, k) => (it === "-" ? "<hr>" : `<button data-k="${k}">${it.icon || ""}<span>${esc(it.label)}${it.sub ? `<small>${esc(it.sub)}</small>` : ""}</span>${it.checked ? '<span class="check-mark">✓</span>' : ""}</button>`))
+    .map((it, k) => (it === "-" ? "<hr>" : `<button data-k="${k}">${it.icon || ""}<span>${esc(it.label)}${it.sub ? `<small>${esc(it.sub)}</small>` : ""}</span>${it.checked ? '<span class="check-mark"><svg viewBox="0 0 12 12" width="12" height="12"><path d="M2.5 6.3 5 8.6l4.5-5" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"/></svg>' : ""}</button>`))
     .join("");
   m.hidden = false;
   const r = anchor.getBoundingClientRect();
