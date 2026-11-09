@@ -31,6 +31,21 @@ Its own data (the file list and what was restored) is kept in `~/Library/Applica
 - Use it at your own risk. It is MIT licensed, with no warranty.
 - Restored files take space in your iCloud storage. Check that you have enough free space first.
 
+## Download
+
+Get `Salvage-<version>-macos-arm64.zip` from [Releases](https://github.com/haim-ari/salvage/releases). It is for Macs with Apple silicon (M1 or later). For an Intel Mac, build it yourself (see below).
+
+The app is not signed by Apple. The first time, macOS blocks it. To open it:
+
+1. Unzip it and move `Salvage.app` to Applications.
+2. Right-click `Salvage.app` and pick **Open**, then **Open** again.
+
+If that does not work, run this once, then open the app:
+
+```bash
+xattr -dr com.apple.quarantine /Applications/Salvage.app
+```
+
 ## Build
 
 You need macOS 13 or later, [Rust](https://rustup.rs) 1.90 or later, and [bun](https://bun.sh).
