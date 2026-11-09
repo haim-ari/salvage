@@ -1,0 +1,15 @@
+{
+  "name": "salvage",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Fast native restore client for iCloud Drive deleted files",
+  "license": "MIT",
+  "scripts": {
+    "dev": "tauri dev",
+    "build": "tauri build --bundles app",
+    "tauri": "tauri"
+  },
+  "devDependencies": {
+    "@tauri-apps/cli": "^2"
+  }
+}
