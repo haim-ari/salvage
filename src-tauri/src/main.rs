@@ -85,23 +85,54 @@ fn sign_out(app: AppHandle, state: State<AppState>) {
     let _ = app.emit("auth://changed", Option::<Account>::None);
 }
 
+/// What the window needs of one file. Hidden copies and fields only the restore uses stay here.
+#[derive(Serialize)]
+struct UiItem<'a> {
+    i: &'a str,
+    n: &'a str,
+    e: &'a str,
+    s: u64,
+    d: i64,
+    m: i64,
+    c: i64,
+    f: u32,
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    x: bool,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct UiSnapshot<'a> {
+    scanned_at: i64,
+    items: Vec<UiItem<'a>>,
+    folders: &'a [model::Folder],
+    partial_paths: bool,
+    copies_checked: bool,
+}
+
 #[derive(Serialize)]
 struct View<'a> {
-    snapshot: &'a Snapshot,
+    snapshot: UiSnapshot<'a>,
     restored: &'a HashSet<String>,
 }
 
 fn view(state: &AppState) -> Response {
-    let json = state
-        .snapshot
-        .read()
-        .clone()
-        .and_then(|snap| {
-            let restored = state.restored.lock();
-            serde_json::to_string(&View { snapshot: &snap, restored: &restored }).ok()
-        })
-        .unwrap_or_else(|| "null".into());
-    Response::new(json)
+    let Some(snap) = state.snapshot.read().clone() else { return Response::new("null".to_string()) };
+    let items = snap
+        .items
+        .iter()
+        .filter(|it| !it.u)
+        .map(|it| UiItem { i: &it.i, n: &it.n, e: &it.e, s: it.s, d: it.d, m: it.m, c: it.c, f: it.f, x: it.x })
+        .collect();
+    let snapshot = UiSnapshot {
+        scanned_at: snap.scanned_at,
+        items,
+        folders: &snap.folders,
+        partial_paths: snap.partial_paths,
+        copies_checked: snap.copies_checked,
+    };
+    let restored = state.restored.lock();
+    Response::new(serde_json::to_string(&View { snapshot, restored: &restored }).unwrap_or_else(|_| "null".into()))
 }
 
 #[tauri::command]
@@ -266,8 +297,14 @@ async fn scan(app: AppHandle, fresh: Option<bool>) -> CmdResult<Response> {
     };
     let mut unverified = st.pages > 0;
 
+    // The next page is asked for while the folders of this page are looked up.
+    let mut fetched: Option<Result<(Vec<Value>, Option<String>), ApiError>> = None;
     while !st.complete {
-        let (docs, next) = match icloud.tombstone_page(st.marker.as_deref()).await {
+        let page = match fetched.take() {
+            Some(p) => p,
+            None => icloud.tombstone_page(st.marker.as_deref()).await,
+        };
+        let (docs, next) = match page {
             Ok(x) => x,
             Err(ApiError::AuthExpired) => return Err(ApiError::AuthExpired),
             Err(e) if unverified => {
@@ -282,9 +319,6 @@ async fn scan(app: AppHandle, fresh: Option<bool>) -> CmdResult<Response> {
             Err(e) => return Err(e),
         };
         unverified = false;
-        if st.pages == 0 {
-            state.store.save_sample(&docs);
-        }
         for d in &docs {
             b.push(d);
         }
@@ -293,7 +327,17 @@ async fn scan(app: AppHandle, fresh: Option<bool>) -> CmdResult<Response> {
         st.marker = next;
         state.store.scan_page(&st, &docs);
         let _ = app.emit("scan://progress", serde_json::json!({ "count": b.items.len(), "phase": "list" }));
-        if resolve_paths(&app, icloud, &b, &mut resolved, &mut tried).await? {
+        let looked_up = if st.complete {
+            resolve_paths(&app, icloud, &b, &mut resolved, &mut tried).await
+        } else {
+            let (page, looked_up) = tokio::join!(
+                icloud.tombstone_page(st.marker.as_deref()),
+                resolve_paths(&app, icloud, &b, &mut resolved, &mut tried)
+            );
+            fetched = Some(page);
+            looked_up
+        };
+        if looked_up? {
             save(&resolved, &tried);
         }
         b.relayout(&resolved);

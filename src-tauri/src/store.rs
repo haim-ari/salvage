@@ -1,11 +1,11 @@
-//! Local cache in the app data folder: last scan, restored ids, a raw sample for diagnostics.
+//! Local cache in the app data folder: last scan, restored ids, scan pages, folder paths.
 
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use serde_json::Value;
 use std::{
     collections::{HashMap, HashSet},
     io::{BufRead, Write},
-    path::PathBuf,
+    path::{Path, PathBuf},
 };
 
 use crate::model::Snapshot;
@@ -42,6 +42,7 @@ pub struct Store {
 impl Store {
     pub fn new(dir: PathBuf) -> Self {
         let _ = std::fs::create_dir_all(&dir);
+        migrate(&dir);
         Self { dir }
     }
 
@@ -74,12 +75,6 @@ impl Store {
 
     pub fn save_restored(&self, ids: &HashSet<String>) {
         self.write("restored.json", ids);
-    }
-
-    /// Keeps the first raw records Apple returned, so field mapping can be checked offline.
-    pub fn save_sample(&self, docs: &[serde_json::Value]) {
-        let sample: Vec<_> = docs.iter().take(5).cloned().collect();
-        self.write("tombstone-sample.json", &sample);
     }
 
     pub fn scan_state(&self) -> Option<ScanState> {
@@ -129,36 +124,65 @@ impl Store {
         self.write("paths-cache.json", &PathCacheRef { dsid, resolved, tried });
     }
 
-    pub fn fingerprints(&self) -> HashMap<String, String> {
-        self.read("fingerprints.json").unwrap_or_default()
-    }
-
-    pub fn save_fingerprints(&self, f: &HashMap<String, String>) {
-        self.write("fingerprints.json", f);
-    }
-
-    /// docwsid -> Apple's download link, from the saved list pages.
-    pub fn tombstone_urls(&self) -> HashMap<String, String> {
-        let mut out = HashMap::new();
-        let Ok(f) = std::fs::File::open(self.dir.join("tombstones.jsonl")) else { return out };
-        for line in std::io::BufReader::new(f).lines().map_while(Result::ok) {
-            let Ok(docs) = serde_json::from_str::<Vec<Value>>(&line) else { continue };
-            for d in docs {
-                if let (Some(di), Some(u)) = (d["docwsid"].as_str(), d["urls"]["url_download"].as_str()) {
-                    out.insert(di.to_string(), u.to_string());
-                }
-            }
-        }
-        out
-    }
-
     pub fn clear_paths(&self) {
         let _ = std::fs::remove_file(self.dir.join("paths-cache.json"));
     }
 
     pub fn clear(&self) {
-        for f in ["snapshot.json", "restored.json", "tombstone-sample.json", "scan-state.json", "tombstones.jsonl", "paths-cache.json", "fingerprints.json"] {
+        for f in FILES {
             let _ = std::fs::remove_file(self.dir.join(f));
         }
+    }
+}
+
+/// Every file the store keeps.
+const FILES: [&str; 5] = ["snapshot.json", "restored.json", "scan-state.json", "tombstones.jsonl", "paths-cache.json"];
+/// The data folder of versions before 0.1.1, next to the current one.
+const OLD_DIR: &str = "com.haimari.salvage";
+
+/// Versions before 0.1.1 kept data under another app id. Move it once, so the last scan and
+/// the list of restored files are not lost. Also delete files that no version reads any more.
+fn migrate(dir: &Path) {
+    for f in ["tombstone-sample.json", "fingerprints.json"] {
+        let _ = std::fs::remove_file(dir.join(f));
+    }
+    let Some(old) = dir.parent().map(|p| p.join(OLD_DIR)) else { return };
+    if old == dir || !old.is_dir() || FILES.iter().any(|f| dir.join(f).exists()) {
+        return;
+    }
+    for f in FILES {
+        let (from, to) = (old.join(f), dir.join(f));
+        if from.exists() && std::fs::rename(&from, &to).is_err() && std::fs::copy(&from, &to).is_ok() {
+            let _ = std::fs::remove_file(&from);
+        }
+    }
+    for f in ["tombstone-sample.json", "fingerprints.json"] {
+        let _ = std::fs::remove_file(old.join(f));
+    }
+    let _ = std::fs::remove_dir(&old);
+    tracing::info!(target: "store", "moved data from the old app folder");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn moves_old_data_once() {
+        let root = std::env::temp_dir().join(format!("salvage-{}", uuid::Uuid::new_v4()));
+        let old = root.join(OLD_DIR);
+        let new = root.join("io.github.haim-ari.salvage");
+        std::fs::create_dir_all(&old).unwrap();
+        std::fs::write(old.join("restored.json"), r#"["a"]"#).unwrap();
+        std::fs::write(old.join("tombstone-sample.json"), "[]").unwrap();
+        let s = Store::new(new.clone());
+        assert!(s.restored().contains("a"));
+        assert!(!old.exists());
+        // A second start with data in place does not touch anything.
+        std::fs::create_dir_all(&old).unwrap();
+        std::fs::write(old.join("restored.json"), r#"["b"]"#).unwrap();
+        let s = Store::new(new);
+        assert!(!s.restored().contains("b"));
+        let _ = std::fs::remove_dir_all(root);
     }
 }

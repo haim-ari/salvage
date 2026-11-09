@@ -112,7 +112,7 @@ async fn check(resp: Response) -> ApiResult<Response> {
     Ok(resp)
 }
 
-fn s(v: &Value) -> Option<String> {
+fn str_of(v: &Value) -> Option<String> {
     match v {
         Value::String(x) if !x.is_empty() => Some(x.clone()),
         Value::Number(n) => Some(n.to_string()),
@@ -190,24 +190,24 @@ impl Icloud {
             .await?;
         let v: Value = check(resp).await?.json().await?;
         let ds = &v["dsInfo"];
-        let dsid = s(&ds["dsid"]).ok_or_else(|| ApiError::Shape("validate: no dsid".into()))?;
+        let dsid = str_of(&ds["dsid"]).ok_or_else(|| ApiError::Shape("validate: no dsid".into()))?;
         let ws = &v["webservices"];
-        let drivews = s(&ws["drivews"]["url"]).map(|u| host_url(&u));
-        let docws = s(&ws["docws"]["url"])
+        let drivews = str_of(&ws["drivews"]["url"]).map(|u| host_url(&u));
+        let docws = str_of(&ws["docws"]["url"])
             .map(|u| host_url(&u))
             .or_else(|| drivews.as_ref().map(|d| d.replace("-drivews.", "-docws.")));
         let (Some(drivews), Some(docws)) = (drivews, docws) else {
             return Err(ApiError::Shape("validate: iCloud Drive is not enabled for this account".into()));
         };
-        let name = s(&ds["fullName"])
+        let name = str_of(&ds["fullName"])
             .or_else(|| {
-                let f = s(&ds["firstName"]).unwrap_or_default();
-                let l = s(&ds["lastName"]).unwrap_or_default();
+                let f = str_of(&ds["firstName"]).unwrap_or_default();
+                let l = str_of(&ds["lastName"]).unwrap_or_default();
                 let n = format!("{f} {l}").trim().to_string();
                 (!n.is_empty()).then_some(n)
             })
             .unwrap_or_else(|| "iCloud account".into());
-        let apple_id = s(&ds["appleId"]).or_else(|| s(&ds["primaryEmail"])).unwrap_or_default();
+        let apple_id = str_of(&ds["appleId"]).or_else(|| str_of(&ds["primaryEmail"])).unwrap_or_default();
         let account = Account { dsid, name, apple_id };
         *self.session.write() = Some(Session { account: account.clone(), docws, drivews, client_id });
         Ok(account)
@@ -248,18 +248,11 @@ impl Icloud {
                 }
             }
         };
-        {
-            let mut rest = v.clone();
-            if let Some(o) = rest.as_object_mut() {
-                o.insert("documents".into(), Value::String("(omitted)".into()));
-            }
-            diag("page-keys.json", &rest);
-        }
         let docs = match v.get_mut("documents").map(Value::take) {
             Some(Value::Array(d)) => d,
             _ => Vec::new(),
         };
-        let next = s_opt(&v["continuationMarker"]).filter(|_| v["status"].as_str() == Some("MORE_AVAILABLE"));
+        let next = str_of(&v["continuationMarker"]).filter(|_| v["status"].as_str() == Some("MORE_AVAILABLE"));
         Ok((docs, next))
     }
 
@@ -281,14 +274,14 @@ impl Icloud {
         if let Some(list) = v["drive_items_with_status"].as_array() {
             let per_item = list.iter().any(|e| e.get("item_id").is_some() || e.get("drive_item").is_some());
             for (i, e) in list.iter().enumerate() {
-                let code = s_opt(&e["status_code"]).unwrap_or_else(|| "200".into());
+                let code = str_of(&e["status_code"]).unwrap_or_else(|| "200".into());
                 if code == "200" {
                     continue;
                 }
-                let msg = s_opt(&e["status_message"]).unwrap_or_else(|| format!("status {code}"));
+                let msg = str_of(&e["status_message"]).unwrap_or_else(|| format!("status {code}"));
                 if per_item {
-                    let id = s_opt(&e["item_id"])
-                        .or_else(|| s_opt(&e["drive_item"]["item_id"]))
+                    let id = str_of(&e["item_id"])
+                        .or_else(|| str_of(&e["drive_item"]["item_id"]))
                         .or_else(|| ids.get(i).cloned())
                         .unwrap_or_default();
                     failed.push((id, msg));
@@ -317,10 +310,7 @@ impl Icloud {
             .send()
             .await?;
         let v: Value = check(resp).await?.json().await?;
-        if hierarchy {
-            diag("lookup-sample.json", &json!({ "asked": drivewsids.iter().take(5).collect::<Vec<_>>(), "reply": v.as_array().map(|a| a.iter().take(5).cloned().collect::<Vec<_>>()) }));
-        }
-        Ok(v.as_array().cloned().unwrap_or_default())
+        Ok(match v { Value::Array(a) => a, _ => Vec::new() })
     }
 
     pub async fn create_folder(&self, parent: &str, name: &str) -> ApiResult<String> {
@@ -340,7 +330,7 @@ impl Icloud {
             .await?;
         let v: Value = check(resp).await?.json().await?;
         let f = &v["folders"][0];
-        match (s_opt(&f["drivewsid"]), f["status"].as_str()) {
+        match (str_of(&f["drivewsid"]), f["status"].as_str()) {
             (Some(id), Some("OK") | None) => Ok(id),
             _ => Err(ApiError::Shape(format!("could not create folder \"{name}\""))),
         }
@@ -369,15 +359,15 @@ impl Icloud {
                 .timeout(Duration::from_secs(90))
                 .send()
                 .await?;
-            let v: Value = check(resp).await?.json().await?;
-            let results = v["items"].as_array().cloned().unwrap_or_default();
+            let mut v: Value = check(resp).await?.json().await?;
+            let results = match v.get_mut("items").map(Value::take) { Some(Value::Array(a)) => a, _ => Vec::new() };
             let mut retry = Vec::new();
             for (i, r) in results.iter().enumerate() {
-                let id = s_opt(&r["drivewsid"]).or_else(|| pending.get(i).map(|p| p.0.clone())).unwrap_or_default();
+                let id = str_of(&r["drivewsid"]).or_else(|| pending.get(i).map(|p| p.0.clone())).unwrap_or_default();
                 match r["status"].as_str() {
                     Some("OK") | None => {}
                     Some("ETAG_CONFLICT") if attempt < 2 => {
-                        retry.push((id, s_opt(&r["etag"]).unwrap_or_default()));
+                        retry.push((id, str_of(&r["etag"]).unwrap_or_default()));
                     }
                     Some(other) => failed.push((id, format!("move failed: {other}"))),
                 }
@@ -386,22 +376,6 @@ impl Icloud {
         }
         failed.extend(pending.into_iter().map(|(id, _)| (id, "move failed: etag conflict".into())));
         Ok(failed)
-    }
-
-    /// Raw reply of the download lookup (holds the file's content signature).
-    pub async fn download_token(&self, zone: &str, document_id: &str) -> ApiResult<Value> {
-        let s = self.session()?;
-        let zone = if zone.is_empty() { DEFAULT_ZONE } else { zone };
-        let mut q: Vec<(&str, String)> = Self::params(&s).to_vec();
-        q.push(("document_id", document_id.to_string()));
-        let resp = self
-            .http()
-            .get(format!("{}/ws/{}/download/by_id", s.docws, zone))
-            .query(&q)
-            .timeout(Duration::from_secs(60))
-            .send()
-            .await?;
-        Ok(check(resp).await?.json().await?)
     }
 
     pub async fn download_url(&self, zone: &str, document_id: &str) -> ApiResult<String> {
@@ -417,8 +391,8 @@ impl Icloud {
             .send()
             .await?;
         let v: Value = check(resp).await?.json().await?;
-        s_opt(&v["data_token"]["url"])
-            .or_else(|| s_opt(&v["package_token"]["url"]))
+        str_of(&v["data_token"]["url"])
+            .or_else(|| str_of(&v["package_token"]["url"]))
             .ok_or_else(|| ApiError::Shape("no download URL for this file".into()))
     }
 
@@ -438,13 +412,3 @@ impl Icloud {
     }
 }
 
-fn s_opt(v: &Value) -> Option<String> {
-    s(v)
-}
-
-/// Debug only: write a value to $SALVAGE_DIAG/<name> when that variable is set.
-fn diag(name: &str, v: &Value) {
-    if let Ok(dir) = std::env::var("SALVAGE_DIAG") {
-        let _ = std::fs::write(std::path::Path::new(&dir).join(name), serde_json::to_vec_pretty(v).unwrap_or_default());
-    }
-}
