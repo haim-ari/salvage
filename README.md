@@ -73,12 +73,12 @@ You can check this in the code: [`src-tauri/src/auth.rs`](src-tauri/src/auth.rs)
 
 ## Download
 
-Get `Salvage-<version>-macos-arm64.zip` from [Releases](https://github.com/haim-ari/salvage/releases). It is for Macs with Apple silicon (M1 or later). For an Intel Mac, build it yourself (see below).
+Get `Salvage-<version>-macos-arm64.dmg` from [Releases](https://github.com/haim-ari/salvage/releases). It is for Macs with Apple silicon (M1 or later). For an Intel Mac, build it yourself (see below).
 
-The app is not signed by Apple. The first time, macOS blocks it. To open it:
+1. Open the DMG.
+2. Drag `Salvage` to `Applications`.
 
-1. Unzip it and move `Salvage.app` to Applications.
-2. Right-click `Salvage.app` and pick **Open**, then **Open** again.
+The app is not signed by Apple. The first time, macOS blocks it. To open it, right-click `Salvage.app` in Applications and pick **Open**, then **Open** again.
 
 If that does not work, run this once, then open the app:
 
@@ -88,11 +88,10 @@ xattr -dr com.apple.quarantine /Applications/Salvage.app
 
 ## Build
 
-You need macOS 13 or later, [Rust](https://rustup.rs) 1.90 or later, and [bun](https://bun.sh).
+You need macOS 13 or later, [Rust](https://rustup.rs) 1.90 or later, [bun](https://bun.sh) and [just](https://just.systems) (`brew install just`).
 
 ```bash
-bun install
-bun run build
+just app
 ```
 
 The app is in `src-tauri/target/release/bundle/macos/Salvage.app`.
@@ -102,6 +101,22 @@ To run it while you work on it:
 ```bash
 bun run dev
 ```
+
+Run `just` to see all tasks.
+
+## Release
+
+1. Set the new version in `package.json`, `src-tauri/tauri.conf.json` and `src-tauri/Cargo.toml`.
+2. Merge it to `main` on GitHub.
+3. On `main`, run:
+
+```bash
+just dmg
+```
+
+This builds the app, packs it into `dist/Salvage-<version>-macos-<arch>.dmg` and publishes it as a public GitHub release `v<version>`. You need the [GitHub CLI](https://cli.github.com) (`gh`), signed in. If the release already exists, it replaces the DMG in it.
+
+To make only the DMG, with no release, run `just dmg-file`.
 
 ## Code layout
 
