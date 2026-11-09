@@ -19,13 +19,18 @@ It was built to save 57 GB of files that the web page could not handle. In one r
 
 ## How it works
 
-1. You sign in on Apple's own sign-in page, inside the app. Salvage never sees your password (see [Sign in: only with Apple](#sign-in-only-with-apple)).
+1. You sign in on Apple's own sign-in page, inside the app. Salvage never sees your password.<br>
+   Read more: [Sign in: only with Apple](#sign-in-only-with-apple).
 2. Salvage reads the list of deleted files from the same iCloud web service that icloud.com uses.
 3. You pick what to restore. Salvage asks Apple to bring the files back, then moves or downloads them if you asked for that.
 
 Everything runs on your Mac. Salvage talks only to Apple. It sends nothing anywhere else.
 
-Its own data (the file list and what was restored) is kept in `~/Library/Application Support/io.github.haim-ari.salvage/`.
+Its own data (the file list and what was restored) is kept in this folder:
+
+```
+~/Library/Application Support/io.github.haim-ari.salvage/
+```
 
 ## Screenshots
 
@@ -43,7 +48,9 @@ The screenshots use made-up example files and a made-up account.
 
 You sign in to Apple, not to Salvage. Salvage never gets your Apple ID password or your two-factor code.
 
-- **Apple's own page.** "Sign in to iCloud" opens a window with Apple's page, `https://www.icloud.com/iclouddrive/`. You type your Apple ID, password and code there, the same as in Safari.
+- **Apple's own page.** "Sign in to iCloud" opens a window with Apple's page:<br>
+  `https://www.icloud.com/iclouddrive/`<br>
+  You type your Apple ID, password and code there, the same as in Safari.
 - **Only Apple can load in that window.** It loads only Apple sites over HTTPS (`icloud.com`, `apple.com` and Apple's file and content hosts). It blocks every other page.
 - **Salvage does not read what you type.** After you sign in, Apple gives the window a session cookie (a small sign-in ticket). Salvage takes only that ticket, checks it with Apple, and closes the window.
 - **The ticket stays on your Mac.** It is kept in memory and in macOS's own web view storage, not in Salvage's files. It is sent only to Apple.
@@ -63,7 +70,8 @@ sequenceDiagram
     Salvage->>Apple: list and restore your deleted files
 ```
 
-You can check this in the code: [`src-tauri/src/auth.rs`](src-tauri/src/auth.rs).
+You can check this in the code:<br>
+[`src-tauri/src/auth.rs`](src-tauri/src/auth.rs)
 
 ## Important
 
@@ -73,7 +81,10 @@ You can check this in the code: [`src-tauri/src/auth.rs`](src-tauri/src/auth.rs)
 
 ## Download
 
-Get `Salvage-<version>-macos-arm64.dmg` from [Releases](https://github.com/haim-ari/salvage/releases). It is for Macs with Apple silicon (M1 or later). For an Intel Mac, build it yourself (see below).
+Get the DMG from [Releases](https://github.com/haim-ari/salvage/releases):<br>
+`Salvage-<version>-macos-arm64.dmg`
+
+It is for Macs with Apple silicon (M1 or later). For an Intel Mac, build it yourself (see below).
 
 1. Open the DMG.
 2. Drag `Salvage` to `Applications`.
@@ -94,7 +105,11 @@ You need macOS 13 or later, [Rust](https://rustup.rs) 1.90 or later, [bun](https
 just app
 ```
 
-The app is in `src-tauri/target/release/bundle/macos/Salvage.app`.
+The app is in this folder:
+
+```
+src-tauri/target/release/bundle/macos/Salvage.app
+```
 
 To run it while you work on it:
 
@@ -114,7 +129,15 @@ Run `just` to see all tasks.
 just dmg
 ```
 
-This builds the app, packs it into `dist/Salvage-<version>-macos-<arch>.dmg` and publishes it as a public GitHub release `v<version>`. You need the [GitHub CLI](https://cli.github.com) (`gh`), signed in. If the release already exists, it replaces the DMG in it.
+This builds the app and packs it into a DMG:
+
+```
+dist/Salvage-<version>-macos-<arch>.dmg
+```
+
+Then it publishes the DMG as a public GitHub release `v<version>`.
+
+You need the [GitHub CLI](https://cli.github.com) (`gh`), signed in. If the release already exists, it replaces the DMG in it.
 
 To make only the DMG, with no release, run `just dmg-file`.
 
