@@ -121,25 +121,20 @@ Run `just` to see all tasks.
 
 ## Release
 
-1. Set the new version in `package.json`, `src-tauri/tauri.conf.json` and `src-tauri/Cargo.toml`.
-2. Merge it to `main` on GitHub.
-3. On `main`, run:
+Releases are automatic. You do not run anything.
 
-```bash
-just dmg
-```
+1. Open a pull request. CI runs `cargo fmt`, `cargo clippy` and `cargo test`.
+2. Merge it to `main`. You cannot push to `main` directly.
+3. [semantic-release](https://semantic-release.gitbook.io) reads the commit messages since the last tag:
+   - `fix:` makes a patch release (0.2.0 → 0.2.1).
+   - `feat:` makes a minor release (0.2.0 → 0.3.0).
+   - `feat!:` or a `BREAKING CHANGE:` footer makes a major release.
+   - Other types (`docs:`, `chore:`, `ci:`) make no release.
+4. For a release, CI sets the version, builds the DMG, tags `v<version>` and publishes it on [Releases](https://github.com/haim-ari/salvage/releases).
 
-This builds the app and packs it into a DMG:
+The git tag holds the version. The version in the files on `main` is not updated.
 
-```
-dist/Salvage-<version>-macos-<arch>.dmg
-```
-
-Then it publishes the DMG as a public GitHub release `v<version>`.
-
-You need the [GitHub CLI](https://cli.github.com) (`gh`), signed in. If the release already exists, it replaces the DMG in it.
-
-To make only the DMG, with no release, run `just dmg-file`.
+To make a DMG on your Mac with no release, run `just dmg-file`.
 
 ## Code layout
 

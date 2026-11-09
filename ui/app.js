@@ -675,7 +675,7 @@ function renderOverview() {
   for (let i = 0; i < F; i++) kids[i] = kids[i].filter((c) => O.folders[c].files > 0);
   kids.forEach((k) => k.sort(cmp));
   // map path -> snapshot folder index, to open the browser at the right place
-  if (O.complete && !O.map) { O.map = new Map(); S.folders.forEach((f, i) => O.map.set(f.path, i)); }
+  if (O.complete && !O.loading && !O.map) { O.map = new Map(); S.folders.forEach((f, i) => O.map.set(f.path, i)); }
 
   const status = O.complete ? `<span class="pill ok">✓ All found</span>` : `<span class="pill wait"><span class="mini"></span>Finding files</span>`;
   const folderSvg = `<svg class="fold" viewBox="0 0 16 16"><path d="M1.5 4.5a1 1 0 0 1 1-1h3.2l1.3 1.4h6.5a1 1 0 0 1 1 1v6.6a1 1 0 0 1-1 1h-11a1 1 0 0 1-1-1z" fill="currentColor" opacity=".9"/></svg>`;
@@ -728,6 +728,7 @@ function onOverviewClick(e) {
     O.open.has(key) ? O.open.delete(key) : O.open.add(key);
     renderOverview();
   } else if (el.dataset.act === "open") {
+    if (O.loading) { toast("Loading the file list. Try again in a moment."); return; }
     if (!O.complete || O.checking) { toast("Wait until the check is done. Then you can open folders."); return; }
     const f = O.map && O.map.get(key);
     showMain();
@@ -739,7 +740,7 @@ async function signedIn(account, { rescan = false } = {}) {
   S.account = account;
   if (!rescan) {
     const v = await invoke("get_snapshot");
-    if (v) { load(v); overviewFromSnapshot(); showOverview(); checkCopies(); return; }
+    if (v) { load(v); overviewFromSnapshot(); showOverview(); shown(); checkCopies(); return; }
   }
   await scan();
 }
@@ -1231,39 +1232,82 @@ function selectAllShownGlobal(on) {
 
 // ---------------- boot ----------------
 async function boot() {
+  invoke("mark", { stage: "script" });
   wire();
-  await listen("auth://changed", (account) => {
-    if (account) signedIn(account); // keeps the saved scan; only "Scan again" asks Apple again
-    else { S.account = null; S.items = []; S.sel = null; showGate("signin"); }
-  });
-  await listen("scan://progress", (p) => {
-    O.progress = p.phase === "paths"
-      ? `Finding folder names${p.total ? ` (${n(p.done)} of ${n(p.total)})` : ""}…`
-      : `Apple has sent ${plural(p.count, "file")} so far…`;
-    if (!$("gate").hidden) $("gate-progress-text").textContent = O.progress;
-    renderOvState();
-  });
-  await listen("scan://folders", (p) => {
-    O.folders = p.folders;
-    O.files = p.files;
-    O.bytes = p.bytes;
-    O.complete = false; // the snapshot load sets this when the scan returns
-    O.map = null;
-    scheduleOverview();
-  });
-  await listen("restore://progress", onProgress);
-  await listen("copies://progress", (p) => {
-    O.progress = `Checking for exact copies (${n(p.done)} of ${n(p.total)})…`;
-    renderOvState();
-  });
+  // Register all listeners at once (one round trip each, in parallel).
+  await Promise.all([
+    listen("auth://changed", (account) => {
+      if (account) signedIn(account); // keeps the saved scan; only "Scan again" asks Apple again
+      else { S.account = null; S.items = []; S.sel = null; showGate("signin"); }
+    }),
+    listen("scan://progress", (p) => {
+      O.progress = p.phase === "paths"
+        ? `Finding folder names${p.total ? ` (${n(p.done)} of ${n(p.total)})` : ""}…`
+        : `Apple has sent ${plural(p.count, "file")} so far…`;
+      if (!$("gate").hidden) $("gate-progress-text").textContent = O.progress;
+      renderOvState();
+    }),
+    listen("scan://folders", (p) => {
+      O.folders = p.folders;
+      O.files = p.files;
+      O.bytes = p.bytes;
+      O.complete = false; // the snapshot load sets this when the scan returns
+      O.map = null;
+      scheduleOverview();
+    }),
+    listen("restore://progress", onProgress),
+    listen("copies://progress", (p) => {
+      O.progress = `Checking for exact copies (${n(p.done)} of ${n(p.total)})…`;
+      renderOvState();
+    }),
+  ]);
   setInterval(renderAccount, 60000);
-
   const st = await invoke("app_state");
   if (st.account) return signedIn(st.account);
-  showGate("busy", "Checking for a saved sign-in…");
-  const acc = await invoke("resume_session");
-  if (acc) return signedIn(acc);
-  showGate("signin");
+  // Show the last saved scan at once. Check the saved sign-in at the same time.
+  const resume = invoke("resume_session");
+  // Paint the folder totals first (small JSON). Load the full file list after.
+  const ov = await invoke("get_overview");
+  let full = null;
+  if (ov) {
+    O.folders = ov.folders;
+    O.files = ov.files;
+    O.bytes = ov.bytes;
+    O.complete = true;
+    O.scanning = false;
+    O.map = null;
+    // Wait for the first paint, so the big list does not delay it.
+    O.loading = afterPaint().then(() => invoke("get_snapshot")).then((v) => {
+      if (v) { load(v); overviewFromSnapshot(); }
+      O.loading = null;
+      renderOverview();
+      return v;
+    });
+    full = O.loading;
+    showOverview();
+  } else showGate("busy", "Checking for a saved sign-in…");
+  shown();
+  const acc = await resume;
+  if (full) await full;
+  if (!acc) { S.items = []; S.sel = null; showGate("signin"); return; }
+  if (ov && ov.dsid === acc.dsid) {
+    S.account = acc;
+    renderAccount();
+    checkCopies();
+    return;
+  }
+  signedIn(acc);
+}
+
+// Resolves after the next frame is on screen.
+const afterPaint = () => new Promise((r) => requestAnimationFrame(() => setTimeout(r, 0)));
+
+// Log once when the first useful screen is painted (startup timing).
+let shownDone = false;
+function shown() {
+  if (shownDone) return;
+  shownDone = true;
+  afterPaint().then(() => invoke("mark", { stage: "shown" }));
 }
 
 boot().catch((e) => showGate("error", String(e)));

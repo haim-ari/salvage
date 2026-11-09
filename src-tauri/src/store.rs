@@ -38,6 +38,7 @@ struct PathCacheRef<'a> {
     tried: &'a HashSet<String>,
 }
 
+#[derive(Clone)]
 pub struct Store {
     dir: PathBuf,
 }
@@ -45,6 +46,11 @@ pub struct Store {
 impl Store {
     pub fn new(dir: PathBuf) -> Self {
         let _ = std::fs::create_dir_all(&dir);
+        // The cache holds file names of the Apple Account: only this user may read it.
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700));
+        }
         migrate(&dir);
         Self { dir }
     }
@@ -65,7 +71,12 @@ impl Store {
     }
 
     pub fn snapshot(&self, dsid: &str) -> Option<Snapshot> {
-        self.read::<Snapshot>("snapshot.json").filter(|s| s.dsid == dsid)
+        self.last_snapshot().filter(|s| s.dsid == dsid)
+    }
+
+    /// The last saved scan, of any Apple Account.
+    pub fn last_snapshot(&self) -> Option<Snapshot> {
+        self.read::<Snapshot>("snapshot.json")
     }
 
     pub fn save_snapshot(&self, s: &Snapshot) {
@@ -87,7 +98,13 @@ impl Store {
     /// Start a new scan: forget saved pages.
     pub fn scan_reset(&self, dsid: &str) {
         let _ = std::fs::remove_file(self.dir.join("tombstones.jsonl"));
-        self.write("scan-state.json", &ScanState { dsid: dsid.into(), ..Default::default() });
+        self.write(
+            "scan-state.json",
+            &ScanState {
+                dsid: dsid.into(),
+                ..Default::default()
+            },
+        );
     }
 
     /// Save one page, then the marker. A crash in between only means a page is read twice.
@@ -123,8 +140,20 @@ impl Store {
         (c.dsid == dsid).then_some((c.resolved, c.tried))
     }
 
-    pub fn save_paths(&self, dsid: &str, resolved: &HashMap<String, Vec<String>>, tried: &HashSet<String>) {
-        self.write("paths-cache.json", &PathCacheRef { dsid, resolved, tried });
+    pub fn save_paths(
+        &self,
+        dsid: &str,
+        resolved: &HashMap<String, Vec<String>>,
+        tried: &HashSet<String>,
+    ) {
+        self.write(
+            "paths-cache.json",
+            &PathCacheRef {
+                dsid,
+                resolved,
+                tried,
+            },
+        );
     }
 
     pub fn clear_paths(&self) {
@@ -139,7 +168,13 @@ impl Store {
 }
 
 /// Every file the store keeps.
-const FILES: [&str; 5] = ["snapshot.json", "restored.json", "scan-state.json", "tombstones.jsonl", "paths-cache.json"];
+const FILES: [&str; 5] = [
+    "snapshot.json",
+    "restored.json",
+    "scan-state.json",
+    "tombstones.jsonl",
+    "paths-cache.json",
+];
 /// The data folder of versions before 0.1.1, next to the current one.
 const OLD_DIR: &str = "com.haimari.salvage";
 
@@ -149,13 +184,18 @@ fn migrate(dir: &Path) {
     for f in ["tombstone-sample.json", "fingerprints.json"] {
         let _ = std::fs::remove_file(dir.join(f));
     }
-    let Some(old) = dir.parent().map(|p| p.join(OLD_DIR)) else { return };
+    let Some(old) = dir.parent().map(|p| p.join(OLD_DIR)) else {
+        return;
+    };
     if old == dir || !old.is_dir() || FILES.iter().any(|f| dir.join(f).exists()) {
         return;
     }
     for f in FILES {
         let (from, to) = (old.join(f), dir.join(f));
-        if from.exists() && std::fs::rename(&from, &to).is_err() && std::fs::copy(&from, &to).is_ok() {
+        if from.exists()
+            && std::fs::rename(&from, &to).is_err()
+            && std::fs::copy(&from, &to).is_ok()
+        {
             let _ = std::fs::remove_file(&from);
         }
     }

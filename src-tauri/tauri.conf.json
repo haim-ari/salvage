@@ -10,6 +10,7 @@
     "windows": [
       {
         "label": "main",
+        "create": false,
         "title": "Salvage",
         "width": 1320,
         "height": 840,
@@ -24,6 +25,7 @@
       }
     ],
     "security": {
+      "freezePrototype": true,
       "csp": "default-src 'self'; img-src 'self' data:; style-src 'self' 'unsafe-inline'; script-src 'self'; connect-src ipc: http://ipc.localhost"
     }
   },

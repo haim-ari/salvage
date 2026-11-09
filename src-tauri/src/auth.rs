@@ -19,9 +19,17 @@ fn allowed(u: &Url) -> bool {
         return false;
     }
     let h = u.host_str().unwrap_or_default();
-    ["icloud.com", "apple.com", "cdn-apple.com", "apple-cloudkit.com", "icloud-content.com", "mzstatic.com", "apple-mapkit.com"]
-        .iter()
-        .any(|d| h == *d || h.ends_with(&format!(".{d}")))
+    [
+        "icloud.com",
+        "apple.com",
+        "cdn-apple.com",
+        "apple-cloudkit.com",
+        "icloud-content.com",
+        "mzstatic.com",
+        "apple-mapkit.com",
+    ]
+    .iter()
+    .any(|d| h == *d || h.ends_with(&format!(".{d}")))
 }
 
 pub fn read_cookies<R: tauri::Runtime>(w: &tauri::WebviewWindow<R>) -> Vec<RawCookie> {
@@ -38,12 +46,16 @@ pub fn read_cookies<R: tauri::Runtime>(w: &tauri::WebviewWindow<R>) -> Vec<RawCo
 }
 
 fn has_session(cookies: &[RawCookie]) -> bool {
-    cookies.iter().any(|c| c.name.starts_with("X-APPLE-WEBAUTH-TOKEN") || c.name == "X-APPLE-WEBAUTH-USER")
+    cookies
+        .iter()
+        .any(|c| c.name.starts_with("X-APPLE-WEBAUTH-TOKEN") || c.name == "X-APPLE-WEBAUTH-USER")
 }
 
 /// Silent sign-in at launch from cookies kept by the system web view store.
 pub async fn resume(app: &AppHandle) -> bool {
-    let Some(main) = app.get_webview_window("main") else { return false };
+    let Some(main) = app.get_webview_window("main") else {
+        return false;
+    };
     let cookies = read_cookies(&main);
     if !has_session(&cookies) {
         return false;
@@ -58,21 +70,27 @@ pub fn open(app: &AppHandle) -> tauri::Result<()> {
         w.set_focus()?;
         return Ok(());
     }
-    let w = WebviewWindowBuilder::new(app, LOGIN_LABEL, WebviewUrl::External(START.parse().expect("url")))
-        .title("Sign in to iCloud")
-        .inner_size(1000.0, 780.0)
-        .min_inner_size(720.0, 600.0)
-        .center()
-        .user_agent(USER_AGENT)
-        .on_navigation(allowed)
-        .build()?;
+    let w = WebviewWindowBuilder::new(
+        app,
+        LOGIN_LABEL,
+        WebviewUrl::External(START.parse().expect("url")),
+    )
+    .title("Sign in to iCloud")
+    .inner_size(1000.0, 780.0)
+    .min_inner_size(720.0, 600.0)
+    .center()
+    .user_agent(USER_AGENT)
+    .on_navigation(allowed)
+    .build()?;
 
     let app = app.clone();
     tauri::async_runtime::spawn(async move {
         let mut tick = tokio::time::interval(Duration::from_millis(1200));
         loop {
             tick.tick().await;
-            let Some(win) = app.get_webview_window(LOGIN_LABEL) else { break };
+            let Some(win) = app.get_webview_window(LOGIN_LABEL) else {
+                break;
+            };
             let cookies = read_cookies(&win);
             if !has_session(&cookies) {
                 continue;
@@ -89,7 +107,9 @@ pub fn open(app: &AppHandle) -> tauri::Result<()> {
                     let _ = win.close();
                     break;
                 }
-                Err(e) => tracing::warn!(target: "auth", error = %e, "validate failed, still waiting"),
+                Err(e) => {
+                    tracing::warn!(target: "auth", error = %e, "validate failed, still waiting")
+                }
             }
         }
     });
