@@ -22,10 +22,10 @@ futures = "0.3"
 thiserror = "2"
 uuid = { version = "1", features = ["v4"] }
 url = "2"
-parking_lot = "0.12"
+parking_lot = "0.13"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["json", "env-filter"] }
-sha2 = "0.10"
+sha2 = "0.11"
 
 [profile.release]
 opt-level = 3
